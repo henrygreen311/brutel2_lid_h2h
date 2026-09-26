@@ -18,10 +18,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
-          pip install google-cloud-bigquery google-auth
+          pip install \
+            google-cloud-bigquery \
+            google-auth \
+            google-api-python-client \
+            supabase
 
       - name: Run ETH exporter
         env:
