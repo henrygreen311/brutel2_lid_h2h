@@ -34,7 +34,7 @@ PROGRESS_EVERY = 250_000
 OUTPUT_FILE = "eth_addresses.txt"
 
 # Drive scopes
-DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
 # ------------------ DB CONFIG (from brute.py) ------------------
