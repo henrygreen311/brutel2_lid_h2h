@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      - name: Log runner resources
+      - name: Log runner resources (before)
         run: |
           echo "--- CPU ---"
           nproc
@@ -24,6 +24,8 @@ jobs:
           free -h
           echo "--- Disk ---"
           df -h
+          echo "--- Workspace disk ---"
+          df -h "$GITHUB_WORKSPACE"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,6 +39,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Log runner resources (after install)
+        run: |
+          echo "--- RAM ---"
+          free -h
+          echo "--- Disk ---"
+          df -h
+
       - name: Run BTC exporter
         env:
           PYTHONUNBUFFERED: "1"
@@ -49,3 +58,11 @@ jobs:
           else
             python3 main.py
           fi
+
+      - name: Log runner resources (after run)
+        if: always()
+        run: |
+          echo "--- RAM ---"
+          free -h
+          echo "--- Disk ---"
+          df -h
