@@ -22,8 +22,8 @@ GCP_KEY_FILE = "gcp-service-account.json"
 # Hardcoded Drive folder ID (same folder as ETH)
 DRIVE_FOLDER_ID = "1nEsc-2eL5tVzJ710bqBLw6IoTOKmAoav"
 
-# SOL threshold in lamports (0.82 SOL = 820,000,000 lamports)
-SOL_THRESHOLD_LAMPORTS = 820_000_000
+# SOL threshold in lamports (0.41 SOL = 410,000,000 lamports)
+SOL_THRESHOLD_LAMPORTS = 410_000_000
 
 # Safety cap on estimated bytes scanned (900 GB < 1 TB free tier)
 MAX_BYTES_BUDGET = 900 * 1024 ** 3
