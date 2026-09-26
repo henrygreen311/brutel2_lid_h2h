@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Mode: export, finalize, or status"
+        description: "Mode: export (build DB), finalize (dump .txt + delete DB), status"
         required: true
-        default: "export"
+        default: "finalize"
         type: choice
         options: [export, finalize, status]
 
@@ -24,8 +24,6 @@ jobs:
           free -h
           echo "--- Disk ---"
           df -h
-          echo "--- Workspace disk ---"
-          df -h "$GITHUB_WORKSPACE"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -49,15 +47,20 @@ jobs:
       - name: Run BTC exporter
         env:
           PYTHONUNBUFFERED: "1"
-          MODE: ${{ github.event.inputs.mode || 'export' }}
+          MODE: ${{ inputs.mode }}
         run: |
-          if [ "$MODE" = "finalize" ]; then
-            python3 main.py --finalize --cleanup
-          elif [ "$MODE" = "status" ]; then
-            python3 main.py --status
-          else
-            python3 main.py
-          fi
+          echo "Selected mode: $MODE"
+          case "$MODE" in
+            finalize)
+              python3 main.py --finalize --cleanup
+              ;;
+            status)
+              python3 main.py --status
+              ;;
+            export|*)
+              python3 main.py
+              ;;
+          esac
 
       - name: Log runner resources (after run)
         if: always()
