@@ -1,16 +1,38 @@
-name: eth-export
+name: btc-export
 
 on:
   workflow_dispatch:
-  repository_dispatch:
-    types: [run-eth-export]
+    inputs:
+      mode:
+        description: "Mode: export, merge, or status"
+        required: true
+        default: "export"
+        type: choice
+        options: [export, merge, status]
 
 jobs:
-  export:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 355
 
     steps:
+      - name: Log runner resources
+        run: |
+          echo "--- CPU ---"
+          nproc
+          echo "--- RAM ---"
+          free -h
+          echo "--- /proc/meminfo ---"
+          grep -E 'MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree' /proc/meminfo
+          echo "--- Disk ---"
+          df -h
+          echo "--- Workspace disk ---"
+          df -h "$GITHUB_WORKSPACE"
+          echo "--- Environment ---"
+          echo "Runner OS: $RUNNER_OS"
+          echo "Runner Arch: $RUNNER_ARCH"
+          echo "Workspace: $GITHUB_WORKSPACE"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -21,11 +43,24 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Run ETH exporter
+      - name: Log resources after install
+        run: |
+          echo "--- RAM ---"
+          free -h
+          echo "--- Disk ---"
+          df -h
+
+      - name: Run BTC exporter
         env:
           PYTHONUNBUFFERED: "1"
+          MODE: ${{ github.event.inputs.mode || 'export' }}
         run: |
-          python3 main.py
+          if [ "$MODE" = "merge" ]; then
+            python3 main.py --merge --cleanup
+          elif [ "$MODE" = "status" ]; then
+            python3 main.py --status
+          else
+            python3 main.py
+          fi
