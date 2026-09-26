@@ -3,6 +3,7 @@
 
 import os
 import sys
+import json
 import time
 import argparse
 import urllib.request
@@ -10,7 +11,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 
 # ------------------ CONFIG ------------------
-GCP_KEY_URL = "https://tradex.fwh.is/gcp/gcp-service-account.json"
+GCP_KEY_URL = "https://flat-limit-0c50.qringgreen.workers.dev/"
 GCP_KEY_FILE = "gcp-service-account.json"
 
 # ETH threshold in wei (0.037 ETH)
@@ -26,19 +27,111 @@ OUTPUT_FILE = "eth_addresses.txt"
 
 
 # ------------------ HELPERS ------------------
-def download_service_account():
-    """Download the service account JSON from the remote URL."""
-    print(f"Downloading service account JSON from {GCP_KEY_URL} ...")
+def _is_valid_service_account_json(path):
+    """Return True if the file is a valid GCP service account JSON."""
     try:
-        req = urllib.request.Request(GCP_KEY_URL, headers={"User-Agent": "eth-exporter/1.0"})
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return (
+            isinstance(data, dict)
+            and data.get("type") == "service_account"
+            and "client_email" in data
+            and "private_key" in data
+            and "project_id" in data
+        )
+    except Exception:
+        return False
+
+
+def download_service_account():
+    """
+    Download the service account JSON from Cloudflare Workers.
+    Validates it's real JSON before saving.
+    """
+    if os.path.exists(GCP_KEY_FILE) and _is_valid_service_account_json(GCP_KEY_FILE):
+        print(f"Using existing valid {GCP_KEY_FILE}")
+        return
+
+    print(f"Downloading service account JSON from {GCP_KEY_URL} ...")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+
+    req = urllib.request.Request(GCP_KEY_URL, headers=headers)
+
+    try:
         with urllib.request.urlopen(req, timeout=30) as resp:
+            content_type = resp.headers.get("Content-Type", "")
             data = resp.read()
-        with open(GCP_KEY_FILE, "wb") as f:
-            f.write(data)
-        print(f"Saved {len(data):,} bytes to {GCP_KEY_FILE}")
     except Exception as e:
         print(f"ERROR: Failed to download service account JSON: {e}")
+        _print_download_help()
         sys.exit(1)
+
+    print(f"  Content-Type   : {content_type}")
+    print(f"  Content-Length : {len(data):,} bytes")
+
+    if "html" in content_type.lower():
+        print("\nERROR: Server returned HTML instead of JSON.")
+        print("First 300 bytes of response:")
+        print(data[:300].decode("utf-8", errors="replace"))
+        _print_download_help()
+        sys.exit(1)
+
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"\nERROR: Downloaded content is not valid JSON: {e}")
+        print("First 300 bytes of response:")
+        print(data[:300].decode("utf-8", errors="replace"))
+        _print_download_help()
+        sys.exit(1)
+
+    required = ["type", "client_email", "private_key", "project_id"]
+    missing = [k for k in required if k not in parsed]
+    if missing:
+        print(f"\nERROR: JSON is missing required fields: {missing}")
+        _print_download_help()
+        sys.exit(1)
+
+    if parsed.get("type") != "service_account":
+        print(f"\nERROR: JSON type is '{parsed.get('type')}', expected 'service_account'")
+        sys.exit(1)
+
+    with open(GCP_KEY_FILE, "w", encoding="utf-8") as f:
+        json.dump(parsed, f, indent=2)
+
+    print(f"  ✅ Saved valid service account JSON to {GCP_KEY_FILE}")
+    print(f"     client_email: {parsed['client_email']}")
+    print(f"     project_id  : {parsed['project_id']}")
+
+
+def _print_download_help():
+    print()
+    print("=" * 65)
+    print("DOWNLOAD FAILED — WHAT TO DO")
+    print("=" * 65)
+    print()
+    print("If the Cloudflare Worker URL is unreachable, check:")
+    print("  1. The worker is deployed and the URL is correct.")
+    print("  2. The worker returns 'application/json' as Content-Type.")
+    print("  3. The worker is not behind any auth / rate-limit.")
+    print()
+    print("Alternative: store the JSON as a GitHub Secret:")
+    print("  - Settings → Secrets and variables → Actions")
+    print("  - New secret: GCP_SERVICE_ACCOUNT_JSON")
+    print("  - Paste the full JSON as the value.")
+    print("  - Then the workflow writes it to a file before running main.py.")
+    print()
+    print("=" * 65)
 
 
 def get_client():
@@ -50,11 +143,6 @@ def get_client():
 
 
 def build_query():
-    """
-    ETH query: full snapshot of all addresses with balance >= threshold.
-    The crypto_ethereum.balances table is a single snapshot table (not history),
-    so the scan is small (~10-15 GB) — well within the free tier.
-    """
     return """
         SELECT address
         FROM `bigquery-public-data.crypto_ethereum.balances`
@@ -63,7 +151,6 @@ def build_query():
 
 
 def estimate_cost(client, sql, params):
-    """Dry run to estimate bytes processed."""
     print("\nEstimating query cost (dry run)...")
     job_config = bigquery.QueryJobConfig(
         query_parameters=params,
@@ -79,7 +166,6 @@ def estimate_cost(client, sql, params):
 
 
 def run_query_and_save(client, sql, params):
-    """Execute the query and stream addresses to OUTPUT_FILE."""
     print("\nRunning query...")
     start = time.time()
 
@@ -132,6 +218,10 @@ def main():
         print(f"ERROR: {GCP_KEY_FILE} missing.")
         sys.exit(1)
 
+    if not _is_valid_service_account_json(GCP_KEY_FILE):
+        print(f"ERROR: {GCP_KEY_FILE} is not a valid service account JSON.")
+        sys.exit(1)
+
     client = get_client()
 
     params = [
@@ -140,15 +230,13 @@ def main():
 
     sql = build_query()
 
-    # -------- Cost check --------
     estimated = estimate_cost(client, sql, params)
     if estimated > MAX_BYTES_BUDGET and not args.force:
         print(f"\nABORTING: Estimated scan {estimated / 1024**3:.2f} GB exceeds "
               f"safety budget {MAX_BYTES_BUDGET / 1024**3:.0f} GB.")
-        print("Pass --force to override (may exceed free tier).")
+        print("Pass --force to override.")
         sys.exit(2)
 
-    # -------- Real run --------
     row_count = run_query_and_save(client, sql, params)
     size_mb = file_size_mb(OUTPUT_FILE)
 
