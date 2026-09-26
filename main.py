@@ -7,8 +7,10 @@ import json
 import time
 import sqlite3
 import argparse
+import random
 import urllib.request
 from datetime import datetime, timezone, timedelta
+
 from google.cloud import bigquery
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
@@ -16,6 +18,7 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from supabase import create_client
+
 
 # ------------------ CONFIG ------------------
 GCP_KEY_URL = "https://flat-limit-0c50.qringgreen.workers.dev/"
@@ -58,6 +61,43 @@ CHECKPOINT_EVERY_N_CHUNKS = 5
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
+# Retry tuning
+MAX_RETRIES = 10
+BASE_WAIT = 2
+MAX_WAIT = 90
+
+
+# ------------------ RETRY HELPER ------------------
+def _is_retryable(exc):
+    """Return False only for errors that will never succeed on retry."""
+    msg = str(exc).lower()
+    if "file not found" in msg:
+        return False
+    if "notfound" in msg and "404" in msg:
+        return False
+    return True
+
+
+def retry_call(operation, func, max_retries=MAX_RETRIES):
+    """
+    Run func() with exponential backoff on transient failures.
+    Similar in spirit to brute.py's robust_request, but for sync clients.
+    """
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            last_exc = e
+            if not _is_retryable(e):
+                raise
+            wait = min(BASE_WAIT ** attempt, MAX_WAIT) + random.uniform(0, 3)
+            print(f"  ⚠ {operation} failed (attempt {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                print(f"    Retrying in {wait:.1f}s...")
+                time.sleep(wait)
+    raise last_exc
+
 
 # ------------------ DB CONFIG ------------------
 def load_db_config():
@@ -87,70 +127,162 @@ def get_supabase():
 
 
 # ------------------ GOOGLE DRIVE ------------------
-def _refresh_drive_token():
-    print("Fetching Google Drive token from Supabase...")
-    supabase = get_supabase()
-    res = supabase.table("brute").select("id, drive_token").limit(1).execute()
-    if not res.data:
-        raise RuntimeError("No row in brute table")
-    row = res.data[0]
-    token_json = row.get("drive_token")
-    if not token_json:
-        raise RuntimeError("drive_token is empty in DB")
-
-    creds = Credentials.from_authorized_user_info(json.loads(token_json), DRIVE_SCOPES)
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            print("  Refreshing expired token...")
-            creds.refresh(Request())
-            new_json = creds.to_json()
-            supabase.table("brute").update({"drive_token": new_json}).eq("id", row["id"]).execute()
-            return new_json
-        raise RuntimeError("Drive token invalid and cannot refresh")
-    print("  Token valid.")
-    return token_json
+_drive_service_cache = {"obj": None}
 
 
-def get_drive_service():
+def _build_drive_service():
     token_json = _refresh_drive_token()
     creds = Credentials.from_authorized_user_info(json.loads(token_json), DRIVE_SCOPES)
     return build("drive", "v3", credentials=creds)
 
 
-def drive_find_file(service, name):
-    res = service.files().list(
-        q=f"name = '{name}' and '{DRIVE_FOLDER_ID}' in parents and trashed = false",
-        fields="files(id, name)",
-    ).execute().get("files", [])
-    return res[0]["id"] if res else None
+def get_drive_service():
+    if _drive_service_cache["obj"] is None:
+        _drive_service_cache["obj"] = _build_drive_service()
+    return _drive_service_cache["obj"]
 
 
-def drive_upload(service, local_path, name=None):
+def _reset_drive_service():
+    """Force the next call to rebuild the HTTPS client + refresh the token."""
+    _drive_service_cache["obj"] = None
+
+
+def drive_call(operation, func, max_retries=MAX_RETRIES):
+    """
+    Retry a Drive operation. `func(service) -> result`.
+    The Drive service is rebuilt on every retry because SSL EOF / connection
+    reset errors leave the underlying httplib2 connection unusable.
+    """
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            service = get_drive_service()
+            return func(service)
+        except Exception as e:
+            last_exc = e
+            if not _is_retryable(e):
+                raise
+            wait = min(BASE_WAIT ** attempt, MAX_WAIT) + random.uniform(0, 3)
+            print(f"  ⚠ {operation} failed (attempt {attempt}/{max_retries}): {e}")
+            _reset_drive_service()
+            if attempt < max_retries:
+                print(f"    Retrying in {wait:.1f}s...")
+                time.sleep(wait)
+    raise last_exc
+
+
+def _refresh_drive_token():
+    def _do():
+        print("Fetching Google Drive token from Supabase...")
+        supabase = get_supabase()
+        res = supabase.table("brute").select("id, drive_token").limit(1).execute()
+        if not res.data:
+            raise RuntimeError("No row in brute table")
+        row = res.data[0]
+        token_json = row.get("drive_token")
+        if not token_json:
+            raise RuntimeError("drive_token is empty in DB")
+
+        creds = Credentials.from_authorized_user_info(json.loads(token_json), DRIVE_SCOPES)
+        if not creds.valid:
+            if creds.expired and creds.refresh_token:
+                print("  Refreshing expired token...")
+                creds.refresh(Request())
+                new_json = creds.to_json()
+                supabase.table("brute").update({"drive_token": new_json}).eq("id", row["id"]).execute()
+                return new_json
+            raise RuntimeError("Drive token invalid and cannot refresh")
+        print("  Token valid.")
+        return token_json
+
+    return retry_call("refresh_drive_token", _do, max_retries=5)
+
+
+def drive_find_file(name):
+    def _do(service):
+        return service.files().list(
+            q=f"name = '{name}' and '{DRIVE_FOLDER_ID}' in parents and trashed = false",
+            fields="files(id, name)",
+        ).execute(num_retries=3).get("files", [])
+
+    files = drive_call(f"find_file({name})", _do)
+    return files[0]["id"] if files else None
+
+
+def drive_upload(local_path, name=None):
     name = name or os.path.basename(local_path)
     size_mb = os.path.getsize(local_path) / (1024 * 1024)
     print(f"  Uploading {name} ({size_mb:.2f} MB) ...")
-    media = MediaFileUpload(local_path, mimetype="application/octet-stream", resumable=True)
-    existing_id = drive_find_file(service, name)
-    if existing_id:
-        file = service.files().update(
-            fileId=existing_id, media_body=media, fields="id,name"
-        ).execute()
-    else:
-        metadata = {"name": name, "parents": [DRIVE_FOLDER_ID]}
-        file = service.files().create(
-            body=metadata, media_body=media, fields="id,name"
-        ).execute()
+
+    def _do(service):
+        # Look up existing file (using the same service instance)
+        files = service.files().list(
+            q=f"name = '{name}' and '{DRIVE_FOLDER_ID}' in parents and trashed = false",
+            fields="files(id, name)",
+        ).execute(num_retries=3).get("files", [])
+        existing_id = files[0]["id"] if files else None
+
+        media = MediaFileUpload(
+            local_path, mimetype="application/octet-stream", resumable=True
+        )
+
+        if existing_id:
+            request = service.files().update(
+                fileId=existing_id, media_body=media, fields="id,name"
+            )
+        else:
+            metadata = {"name": name, "parents": [DRIVE_FOLDER_ID]}
+            request = service.files().create(
+                body=metadata, media_body=media, fields="id,name"
+            )
+
+        response = None
+        last_print = 0
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                pct = int(status.progress() * 100)
+                if pct >= last_print + 10:
+                    print(f"    ...{pct}%")
+                    last_print = pct
+        return response
+
+    file = drive_call(f"upload({name})", _do, max_retries=MAX_RETRIES)
     print(f"  ✅ Uploaded {file['name']} (ID: {file['id']})")
     return file["id"]
 
 
-def drive_download(service, file_id, local_path):
-    request = service.files().get_media(fileId=file_id)
-    with open(local_path, "wb") as f:
-        dl = MediaIoBaseDownload(f, request)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
+def drive_download(file_id, local_path):
+    def _do(service):
+        request = service.files().get_media(fileId=file_id)
+        with open(local_path, "wb") as f:
+            dl = MediaIoBaseDownload(f, request)
+            done = False
+            last_print = 0
+            while not done:
+                status, done = dl.next_chunk()
+                if status:
+                    pct = int(status.progress() * 100)
+                    if pct >= last_print + 20:
+                        print(f"    ...{pct}%")
+                        last_print = pct
+        return local_path
+
+    return drive_call(f"download({file_id})", _do, max_retries=MAX_RETRIES)
+
+
+def drive_delete(file_id):
+    def _do(service):
+        return service.files().delete(fileId=file_id).execute(num_retries=3)
+
+    try:
+        return drive_call(f"delete({file_id})", _do, max_retries=MAX_RETRIES)
+    except Exception as e:
+        msg = str(e).lower()
+        if "404" in msg or "notfound" in msg or "file not found" in msg:
+            print(f"  ℹ File {file_id} already gone (404) — treating as deleted.")
+            return None
+        raise
 
 
 # ------------------ BIGQUERY ------------------
@@ -168,11 +300,16 @@ def download_service_account():
         print(f"Using existing {GCP_KEY_FILE}")
         with open(GCP_KEY_FILE) as f:
             return json.load(f)
-    print(f"Downloading service account JSON from {GCP_KEY_URL} ...")
-    req = urllib.request.Request(GCP_KEY_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        parsed = json.loads(resp.read().decode("utf-8"))
-    assert parsed.get("type") == "service_account"
+
+    def _do():
+        print(f"Downloading service account JSON from {GCP_KEY_URL} ...")
+        req = urllib.request.Request(GCP_KEY_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            parsed = json.loads(resp.read().decode("utf-8"))
+        assert parsed.get("type") == "service_account"
+        return parsed
+
+    parsed = retry_call("download_service_account", _do, max_retries=8)
     with open(GCP_KEY_FILE, "w") as f:
         json.dump(parsed, f, indent=2)
     print(f"  ✅ Saved (project: {parsed['project_id']})")
@@ -196,10 +333,14 @@ def get_month_to_date_bytes(client):
           AND creation_time >= TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), MONTH)
           AND total_bytes_billed IS NOT NULL
     """
-    try:
+
+    def _do():
         job = client.query(sql)
         row = next(iter(job.result()))
         return int(row.billed_bytes)
+
+    try:
+        return retry_call("bq_quota_query", _do, max_retries=3)
     except Exception as e:
         print(f"  ⚠ Could not query INFORMATION_SCHEMA ({e}). Assuming 0 used.")
         return 0
@@ -243,8 +384,12 @@ def dry_run(client, start_dt, end_dt):
     job_config = bigquery.QueryJobConfig(
         query_parameters=params, dry_run=True, use_query_cache=False,
     )
-    job = client.query(sql, job_config=job_config)
-    return job.total_bytes_processed or 0
+
+    def _do():
+        job = client.query(sql, job_config=job_config)
+        return job.total_bytes_processed or 0
+
+    return retry_call("bigquery.dry_run", _do, max_retries=5)
 
 
 def run_chunk_into_sqlite(client, start_dt, end_dt, conn):
@@ -259,8 +404,12 @@ def run_chunk_into_sqlite(client, start_dt, end_dt, conn):
         bigquery.ScalarQueryParameter("threshold", "INT64", BTC_THRESHOLD_SAT),
     ]
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    job = client.query(sql, job_config=job_config)
-    result = job.result()
+
+    def _do():
+        job = client.query(sql, job_config=job_config)
+        return job.result()
+
+    result = retry_call("bigquery.query", _do, max_retries=5)
 
     cursor = conn.cursor()
     batch = []
@@ -306,7 +455,6 @@ def open_sqlite():
 
 
 def compact_and_close_sqlite(conn):
-    """Flush WAL, truncate it, then close — frees disk from transient WAL growth."""
     try:
         conn.commit()
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -316,7 +464,6 @@ def compact_and_close_sqlite(conn):
 
 
 def delete_local_db_files():
-    """Delete local DB and any SQLite sidecar files to free runner disk."""
     freed = 0
     for path in [ADDRESSES_DB, ADDRESSES_DB + "-wal", ADDRESSES_DB + "-shm"]:
         if os.path.exists(path):
@@ -330,13 +477,13 @@ def delete_local_db_files():
 
 
 # ------------------ PROGRESS ------------------
-def load_progress(service):
-    file_id = drive_find_file(service, PROGRESS_FILE)
+def load_progress():
+    file_id = drive_find_file(PROGRESS_FILE)
     if not file_id:
         print("No progress file — starting from genesis.")
         return {"next_ts": GENESIS_DATE.isoformat()}
     local = "_progress_tmp.json"
-    drive_download(service, file_id, local)
+    drive_download(file_id, local)
     with open(local) as f:
         p = json.load(f)
     os.remove(local)
@@ -344,11 +491,11 @@ def load_progress(service):
     return p
 
 
-def save_progress(service, progress):
+def save_progress(progress):
     local = "_progress_tmp.json"
     with open(local, "w") as f:
         json.dump(progress, f, indent=2)
-    drive_upload(service, local, PROGRESS_FILE)
+    drive_upload(local, PROGRESS_FILE)
     os.remove(local)
 
 
@@ -363,13 +510,12 @@ def mode_export(args):
     print(f"Using GCP project: {project_id}")
 
     client = get_bq_client()
-    service = get_drive_service()
 
     # Download previous DB checkpoint if present
-    existing_db_id = drive_find_file(service, ADDRESSES_DB_DRIVE)
+    existing_db_id = drive_find_file(ADDRESSES_DB_DRIVE)
     if existing_db_id:
         print(f"\nDownloading previous checkpoint from Drive...")
-        drive_download(service, existing_db_id, ADDRESSES_DB)
+        drive_download(existing_db_id, ADDRESSES_DB)
         size_mb = os.path.getsize(ADDRESSES_DB) / (1024 * 1024)
         print(f"  ✅ Loaded {ADDRESSES_DB} ({size_mb:.2f} MB)")
     else:
@@ -394,7 +540,7 @@ def mode_export(args):
         compact_and_close_sqlite(conn)
         return
 
-    progress = load_progress(service)
+    progress = load_progress()
     next_ts = datetime.fromisoformat(progress["next_ts"])
     now = datetime.now(timezone.utc)
 
@@ -405,7 +551,6 @@ def mode_export(args):
 
     chunks_done = 0
     chunks_since_checkpoint = 0
-    quota_exhausted = False
 
     while next_ts < now:
         chunk_days = get_chunk_days_for_date(next_ts)
@@ -420,7 +565,6 @@ def mode_export(args):
         if estimate > remaining_after_margin:
             print(f"\n⚠ Chunk estimate ({gb:,.2f} GB) exceeds remaining budget "
                   f"({remaining_after_margin / 1024**3:,.2f} GB).")
-            quota_exhausted = True
             break
 
         run_chunk_into_sqlite(client, next_ts, end_ts, conn)
@@ -436,10 +580,16 @@ def mode_export(args):
             print(f"\n  📤 Checkpointing (progress + DB)...")
             conn.commit()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            drive_upload(service, ADDRESSES_DB, ADDRESSES_DB_DRIVE)
-            save_progress(service, progress)
-            chunks_since_checkpoint = 0
-            print(f"  ✅ Checkpoint saved")
+            try:
+                drive_upload(ADDRESSES_DB, ADDRESSES_DB_DRIVE)
+                save_progress(progress)
+                chunks_since_checkpoint = 0
+                print(f"  ✅ Checkpoint saved")
+            except Exception as e:
+                # This should only happen if retries were fully exhausted.
+                # Keep local DB; try again at the next chunk boundary.
+                print(f"  ⚠ Checkpoint upload permanently failed: {e}")
+                print(f"    Local DB preserved; will retry on next chunk.")
         else:
             print(f"  Progress updated locally: next_ts = {next_ts.isoformat()}")
 
@@ -447,12 +597,11 @@ def mode_export(args):
     print(f"\n  📤 Final checkpoint (progress + DB)...")
     conn.commit()
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    drive_upload(service, ADDRESSES_DB, ADDRESSES_DB_DRIVE)
-    save_progress(service, progress)
+    drive_upload(ADDRESSES_DB, ADDRESSES_DB_DRIVE)
+    save_progress(progress)
 
     total_count = conn.execute("SELECT COUNT(*) FROM addresses").fetchone()[0]
 
-    # Close + delete local DB to free runner disk
     compact_and_close_sqlite(conn)
     delete_local_db_files()
 
@@ -477,15 +626,13 @@ def mode_finalize(args):
     print("BTC FINALIZE — dump addresses to text file")
     print("=" * 60)
 
-    service = get_drive_service()
-
-    db_id = drive_find_file(service, ADDRESSES_DB_DRIVE)
+    db_id = drive_find_file(ADDRESSES_DB_DRIVE)
     if not db_id:
         print(f"ERROR: {ADDRESSES_DB_DRIVE} not found on Drive.")
         return
 
     print(f"Downloading {ADDRESSES_DB_DRIVE} from Drive...")
-    drive_download(service, db_id, ADDRESSES_DB)
+    drive_download(db_id, ADDRESSES_DB)
     size_mb = os.path.getsize(ADDRESSES_DB) / (1024 * 1024)
     print(f"  ✅ Downloaded ({size_mb:.2f} MB)")
 
@@ -504,16 +651,15 @@ def mode_finalize(args):
     print(f"  Wrote {FINAL_OUTPUT} ({out_mb:.2f} MB)")
 
     conn.close()
-    # Free disk
     delete_local_db_files()
 
     if not args.skip_upload:
-        drive_upload(service, FINAL_OUTPUT)
+        drive_upload(FINAL_OUTPUT)
 
     if args.cleanup:
         print("\nCleaning up SQLite checkpoint from Drive...")
         try:
-            service.files().delete(fileId=db_id).execute()
+            drive_delete(db_id)
             print(f"  Deleted {ADDRESSES_DB_DRIVE} from Drive")
         except Exception as e:
             print(f"  Failed: {e}")
@@ -529,7 +675,6 @@ def mode_status(args):
 
     download_service_account()
     client = get_bq_client()
-    service = get_drive_service()
 
     used = get_month_to_date_bytes(client)
     remaining = FREE_TIER_BYTES - used
@@ -537,7 +682,7 @@ def mode_status(args):
     print(f"  Used      : {used / 1024**3:,.2f} GB")
     print(f"  Remaining : {remaining / 1024**3:,.2f} GB")
 
-    progress = load_progress(service)
+    progress = load_progress()
     next_ts = datetime.fromisoformat(progress["next_ts"])
     now = datetime.now(timezone.utc)
     total_span = (now - GENESIS_DATE).days
@@ -548,9 +693,12 @@ def mode_status(args):
     print(f"  Next chunk starts at : {next_ts.date()}")
     print(f"  Coverage             : {pct:.1f}% of BTC history")
 
-    db_id = drive_find_file(service, ADDRESSES_DB_DRIVE)
+    db_id = drive_find_file(ADDRESSES_DB_DRIVE)
     if db_id:
-        meta = service.files().get(fileId=db_id, fields="size").execute()
+        meta = drive_call(
+            "get_file_metadata",
+            lambda s: s.files().get(fileId=db_id, fields="size").execute(num_retries=3),
+        )
         size_mb = int(meta.get("size", 0)) / (1024 * 1024)
         print(f"  SQLite on Drive      : {size_mb:.2f} MB")
 
