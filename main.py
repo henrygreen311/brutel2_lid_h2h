@@ -19,11 +19,11 @@ from supabase import create_client
 GCP_KEY_URL = "https://flat-limit-0c50.qringgreen.workers.dev/"
 GCP_KEY_FILE = "gcp-service-account.json"
 
-# Hardcoded Drive folder ID
+# Hardcoded Drive folder ID (same folder as ETH)
 DRIVE_FOLDER_ID = "1nEsc-2eL5tVzJ710bqBLw6IoTOKmAoav"
 
-# ETH threshold in wei (0.037 ETH)
-ETH_THRESHOLD_WEI = 37_000_000_000_000_000
+# SOL threshold in lamports (0.82 SOL = 820,000,000 lamports)
+SOL_THRESHOLD_LAMPORTS = 820_000_000
 
 # Safety cap on estimated bytes scanned (900 GB < 1 TB free tier)
 MAX_BYTES_BUDGET = 900 * 1024 ** 3
@@ -31,15 +31,14 @@ MAX_BYTES_BUDGET = 900 * 1024 ** 3
 # Progress logging interval
 PROGRESS_EVERY = 250_000
 
-OUTPUT_FILE = "eth_addresses.txt"
+OUTPUT_FILE = "sol_addresses.txt"
 
-# Drive scopes
+# Drive scopes — must match the scope used by brute.py's token
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
-# ------------------ DB CONFIG (from brute.py) ------------------
+# ------------------ DB CONFIG ------------------
 def load_db_config():
-    """Read Supabase URL and KEY from db.txt (project root or parent)."""
     here = os.path.dirname(os.path.abspath(__file__))
     for path in (
         os.path.join(here, "db.txt"),
@@ -65,9 +64,8 @@ def get_supabase():
     return create_client(cfg["SUPABASE_URL"], cfg["SUPABASE_KEY"])
 
 
-# ------------------ GOOGLE DRIVE (from Supabase token) ------------------
+# ------------------ GOOGLE DRIVE (token from Supabase) ------------------
 def get_drive_token_from_db():
-    """Fetch drive_token from the brute table."""
     supabase = get_supabase()
     res = supabase.table("brute").select("drive_token").limit(1).execute()
     if not res.data:
@@ -79,7 +77,6 @@ def get_drive_token_from_db():
 
 
 def update_drive_token_in_db(token_json):
-    """Push refreshed token JSON back to the brute table."""
     supabase = get_supabase()
     row = supabase.table("brute").select("id").limit(1).execute()
     if not row.data:
@@ -90,10 +87,6 @@ def update_drive_token_in_db(token_json):
 
 
 def refresh_drive_token_if_needed():
-    """
-    Fetch token from DB, refresh if expired, save back to DB.
-    Returns the token JSON string.
-    """
     print("Fetching Google Drive token from Supabase...")
     token_json = get_drive_token_from_db()
 
@@ -121,7 +114,6 @@ def refresh_drive_token_if_needed():
 
 
 def get_drive_service():
-    """Build a Drive service using the token from Supabase."""
     token_json = refresh_drive_token_if_needed()
     creds = Credentials.from_authorized_user_info(
         info=json.loads(token_json),
@@ -131,7 +123,6 @@ def get_drive_service():
 
 
 def upload_to_drive(local_path, folder_id):
-    """Upload a local file to Google Drive (create or update)."""
     service = get_drive_service()
     name = os.path.basename(local_path)
     size_mb = os.path.getsize(local_path) / (1024 * 1024)
@@ -254,10 +245,15 @@ def get_bq_client():
 
 
 def build_query():
+    """
+    Solana addresses with lamports >= threshold.
+
+    The `pubkey` column is already a base58 STRING — no conversion needed.
+    """
     return """
-        SELECT address
-        FROM `bigquery-public-data.crypto_ethereum.balances`
-        WHERE eth_balance >= @threshold
+        SELECT pubkey AS address
+        FROM `bigquery-public-data.crypto_solana_mainnet_us.Accounts`
+        WHERE lamports >= @threshold
     """
 
 
@@ -285,17 +281,24 @@ def run_query_and_save(client, sql, params):
     result = job.result()
 
     row_count = 0
+    skipped = 0
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         for row in result:
-            f.write(f"{row.address}\n")
+            address = row.address
+            if not address:
+                skipped += 1
+                continue
+            f.write(f"{address}\n")
             row_count += 1
+
             if row_count % PROGRESS_EVERY == 0:
                 elapsed = time.time() - start
                 rate = row_count / elapsed if elapsed > 0 else 0
                 print(f"  ...{row_count:>12,} rows  ({rate:,.0f} rows/s, {elapsed:.0f}s)")
 
     elapsed = time.time() - start
-    print(f"Query finished in {elapsed:.1f}s. Wrote {row_count:,} addresses.")
+    print(f"Query finished in {elapsed:.1f}s. Wrote {row_count:,} addresses."
+          + (f" Skipped {skipped} empty." if skipped else ""))
     return row_count
 
 
@@ -318,14 +321,13 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("ETH ADDRESS EXPORTER")
+    print("SOL ADDRESS EXPORTER")
     print("=" * 60)
-    print(f"Threshold     : {ETH_THRESHOLD_WEI:,} wei (0.037 ETH)")
+    print(f"Threshold     : {SOL_THRESHOLD_LAMPORTS:,} lamports (0.82 SOL)")
     print(f"Safety budget : {MAX_BYTES_BUDGET / 1024**3:.0f} GB (BigQuery free tier = 1 TB)")
     print(f"Drive folder  : {DRIVE_FOLDER_ID}")
     print("=" * 60)
 
-    # --- BigQuery service account ---
     if not args.skip_download:
         download_service_account()
 
@@ -337,9 +339,8 @@ def main():
         print(f"ERROR: {GCP_KEY_FILE} is not a valid service account JSON.")
         sys.exit(1)
 
-    # --- BigQuery run ---
     client = get_bq_client()
-    params = [bigquery.ScalarQueryParameter("threshold", "NUMERIC", ETH_THRESHOLD_WEI)]
+    params = [bigquery.ScalarQueryParameter("threshold", "INT64", SOL_THRESHOLD_LAMPORTS)]
     sql = build_query()
 
     estimated = estimate_cost(client, sql, params)
@@ -352,7 +353,6 @@ def main():
     row_count = run_query_and_save(client, sql, params)
     size_mb = file_size_mb(OUTPUT_FILE)
 
-    # --- Drive upload (token from Supabase) ---
     upload_id = None
     if not args.skip_upload:
         try:
