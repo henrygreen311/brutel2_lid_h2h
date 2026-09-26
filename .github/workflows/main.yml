@@ -22,11 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install \
-            google-cloud-bigquery \
-            google-auth \
-            google-api-python-client \
-            supabase
+          pip install -r requirements.txt
 
       - name: Run ETH exporter
         env:
