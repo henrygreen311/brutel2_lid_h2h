@@ -1,7 +1,8 @@
-mnemonic>=0.21,<0.22
-bip-utils>=2.9.0,<3.0.0
-gdown>=5.1.0,<6.0.0
-supabase>=2.0.0,<3.0.0
-google-auth>=2.23.0
-google-api-python-client>=2.100.0,<3.0.0
-google-cloud-bigquery>=3.11.0,<4.0.0
+mnemonic>=0.21
+bip-utils>=2.9.0
+coincurve>=20.0.0
+gdown>=5.1.0
+supabase>=2.0.0
+google-auth
+google-api-python-client>=2.100.0
+google-cloud-bigquery>=3.11.0
