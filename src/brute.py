@@ -3,12 +3,14 @@
 
 import os
 import sys
+import io
 import json
 import time
 import signal
 import sqlite3
 import subprocess
 import logging
+import contextlib
 import urllib.request
 import urllib.parse
 import gdown
@@ -47,6 +49,7 @@ GENERATOR_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen
 
 ATOMIC_ID = 1
 TELEGRAM_MESSAGE_LIMIT = 4000
+SCAN_LOG_INTERVAL = 300
 
 
 class NullHandler(logging.Handler):
@@ -110,9 +113,9 @@ def update_atomic(fields):
 def set_progress_flag(value):
     try:
         update_atomic({"progress": value})
-        print(f"Set atomic.progress = {value}.")
+        print(f"progress = {value}")
     except Exception as e:
-        print(f"WARNING: could not set progress flag: {e}")
+        print(f"WARN: could not set progress: {e}")
 
 
 def load_telegram_config():
@@ -125,11 +128,11 @@ def load_telegram_config():
                 _telegram_bot_id = cfg.get("bot_id")
                 _telegram_chat_id = cfg.get("chat_id")
         if _telegram_bot_id and _telegram_chat_id:
-            print(f"Telegram alerts enabled (chat_id={_telegram_chat_id}).")
+            print(f"telegram on (chat={_telegram_chat_id})")
         else:
-            print("Telegram alerts disabled (no bot_id/chat_id in atomic.telegram).")
+            print("telegram off")
     except Exception as e:
-        print(f"WARNING: could not load telegram config: {e}")
+        print(f"WARN: telegram config: {e}")
 
 
 def append_found_record(record):
@@ -148,10 +151,10 @@ def append_found_record(record):
         except Exception as e:
             last_err = e
             wait = min(2 ** attempt, 30)
-            print(f"WARNING: append_found_record failed (attempt {attempt}/5): {e}")
+            print(f"WARN: append_found failed ({attempt}/5): {e}")
             if attempt < 5:
                 time.sleep(wait)
-    print(f"WARNING: giving up on append_found_record: {last_err}")
+    print(f"WARN: giving up on append_found: {last_err}")
     return False
 
 
@@ -162,7 +165,7 @@ def _telegram_post(url, payload, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"telegram error: {e}")
         return False
 
 
@@ -191,28 +194,30 @@ def send_telegram_alert(coin, seed, address, extra=None):
     }
     ok = _telegram_post(url, payload)
     if ok:
-        print(f"Telegram alert sent for [{coin}] {address}")
+        print(f"telegram sent [{coin}] {address}")
     return ok
 
 
 def download_public_drive_file(file_id, local_path, label):
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-        print(f"{label} already present ({os.path.getsize(local_path)/(1024*1024):.1f} MB), skipping download.")
+        size_mb = os.path.getsize(local_path) / (1024 * 1024)
+        print(f"{label}: {size_mb:.0f} MB (cached)")
         return local_path
 
-    print(f"Downloading {label} ...")
     try:
-        gdown.download(id=file_id, output=local_path, quiet=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            gdown.download(id=file_id, output=local_path, quiet=True)
     except Exception as e:
         print(f"ERROR downloading {label}: {e}")
         return None
 
     if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
-        print(f"ERROR: {label} download produced no file (is it shared publicly?)")
+        print(f"ERROR: {label} not public or empty")
         return None
 
     size_mb = os.path.getsize(local_path) / (1024 * 1024)
-    print(f"  {label} downloaded ({size_mb:.1f} MB)")
+    print(f"{label}: {size_mb:.0f} MB")
     return local_path
 
 
@@ -279,9 +284,8 @@ def build_sqlite_from_txt(txt_path, db_path, label):
             count = 0
         conn.close()
         if count > 0:
-            print(f"{label} SQLite already built ({count:,} addresses).")
+            print(f"{label} index: {count:,} (cached)")
             return
-    print(f"Building {label} SQLite index ...")
     if os.path.exists(db_path):
         os.remove(db_path)
     conn = sqlite3.connect(db_path)
@@ -304,14 +308,12 @@ def build_sqlite_from_txt(txt_path, db_path, label):
                     conn.commit()
                     total += len(batch)
                     batch.clear()
-                    if total % 5000000 == 0:
-                        print(f"  {label}: {total:,} rows ({time.time()-t0:.0f}s)")
     if batch:
         conn.executemany("INSERT OR IGNORE INTO addresses VALUES (?)", batch)
         conn.commit()
         total += len(batch)
     conn.close()
-    print(f"  {label} SQLite ready: {total:,} addresses in {time.time()-t0:.0f}s")
+    print(f"{label} index: {total:,} ({time.time()-t0:.0f}s)")
 
 
 class AddressChecker:
@@ -351,38 +353,38 @@ def log_match(coin, seed, address, extra=None):
         with open(FOUND_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, separators=(",", ":")) + "\n")
     except Exception as e:
-        print(f"WARNING: could not write local found file: {e}")
+        print(f"WARN: local found file: {e}")
 
     append_found_record(record)
     send_telegram_alert(coin, seed, address, extra=extra)
 
-    print(f"*** MATCH [{coin}] seed={seed} address={address} ***")
+    print(f"MATCH [{coin}] {address} <- {seed}")
 
 
 def ensure_valid_seeds():
     if os.path.exists(VALID_SEEDS_FILE) and os.path.getsize(VALID_SEEDS_FILE) > 0:
         return True
-    print(f"{VALID_SEEDS_FILE} missing — calling generator.py ...")
+    print(f"{VALID_SEEDS_FILE} missing, running generator")
     try:
         result = subprocess.run([sys.executable, GENERATOR_SCRIPT], check=False)
         if result.returncode != 0:
-            print(f"generator.py exited with code {result.returncode}")
+            print(f"generator exit: {result.returncode}")
             return False
     except Exception as e:
-        print(f"Failed to run generator.py: {e}")
+        print(f"generator failed: {e}")
         return False
     return os.path.exists(VALID_SEEDS_FILE) and os.path.getsize(VALID_SEEDS_FILE) > 0
 
 
 def call_generator_for_next_round():
-    print("All seeds scanned. Calling generator.py for next round ...")
+    print("calling generator for next round")
     try:
         result = subprocess.run([sys.executable, GENERATOR_SCRIPT], check=False)
         if result.returncode != 0:
-            print(f"generator.py exited with code {result.returncode}")
+            print(f"generator exit: {result.returncode}")
             return False
     except Exception as e:
-        print(f"Failed to run generator.py: {e}")
+        print(f"generator failed: {e}")
         return False
     return True
 
@@ -391,9 +393,9 @@ def finalize_round():
     if os.path.exists(VALID_SEEDS_FILE):
         try:
             os.remove(VALID_SEEDS_FILE)
-            print(f"Deleted {VALID_SEEDS_FILE}.")
+            print(f"deleted {VALID_SEEDS_FILE}")
         except OSError as e:
-            print(f"WARNING: could not delete {VALID_SEEDS_FILE}: {e}")
+            print(f"WARN: delete {VALID_SEEDS_FILE}: {e}")
 
     set_progress_flag(True)
     call_generator_for_next_round()
@@ -408,12 +410,13 @@ def scan_all_seeds(btc_checker, eth_checker, sol_checker, stop_event):
         seeds = [line.strip() for line in f if line.strip()]
 
     total = len(seeds)
-    print(f"Loaded {total:,} seed phrases from {VALID_SEEDS_FILE}")
+    print(f"scanning {total:,}")
 
     t0 = time.time()
+    last_log = t0
     for idx, seed in enumerate(seeds, 1):
         if stop_event.is_set():
-            print("Stop signal received, exiting scan loop.")
+            print("stop signal")
             break
 
         btc_addrs = derive_btc_addresses(seed)
@@ -430,13 +433,15 @@ def scan_all_seeds(btc_checker, eth_checker, sol_checker, stop_event):
             log_match("SOL", seed, sol_addr)
 
         scanned_counter += 1
-        if idx % 100000 == 0:
-            elapsed = time.time() - t0
-            rate = idx / elapsed if elapsed else 0
-            print(f"Scanned {idx:,}/{total:,} ({100.0*idx/total:.1f}%)  rate={rate:,.0f}/s  matches={match_counter}")
+        now = time.time()
+        if now - last_log >= SCAN_LOG_INTERVAL:
+            rate = idx / (now - t0) if (now - t0) else 0
+            print(f"scanned {idx:,}/{total:,} ({rate:,.0f}/s, {match_counter} hits)")
+            last_log = now
 
     elapsed = time.time() - t0
-    print(f"\nScan finished in {elapsed:.1f}s. Scanned={scanned_counter:,}  Matches={match_counter}")
+    rate = scanned_counter / elapsed if elapsed else 0
+    print(f"scan done: {scanned_counter:,} in {elapsed:.0f}s ({rate:,.0f}/s), {match_counter} hits")
     return scanned_counter, match_counter
 
 
@@ -445,25 +450,25 @@ def main():
 
     row = get_atomic_row()
     if row is None:
-        print("ERROR: atomic table has no row with id=1. Run the SQL setup first.")
+        print("ERROR: atomic row id=1 missing")
         sys.exit(1)
 
     load_telegram_config()
 
     if not ensure_valid_seeds():
-        print("ERROR: could not produce valid_seeds.txt. Exiting.")
+        print("ERROR: no valid_seeds.txt")
         sys.exit(1)
 
-    if not download_public_drive_file(BTC_FILE_ID, BTC_TXT, "BTC addresses"):
+    if not download_public_drive_file(BTC_FILE_ID, BTC_TXT, "btc"):
         sys.exit(1)
-    if not download_public_drive_file(ETH_FILE_ID, ETH_TXT, "ETH addresses"):
+    if not download_public_drive_file(ETH_FILE_ID, ETH_TXT, "eth"):
         sys.exit(1)
-    if not download_public_drive_file(SOL_FILE_ID, SOL_TXT, "SOL addresses"):
+    if not download_public_drive_file(SOL_FILE_ID, SOL_TXT, "sol"):
         sys.exit(1)
 
-    build_sqlite_from_txt(BTC_TXT, BTC_DB, "BTC")
-    build_sqlite_from_txt(ETH_TXT, ETH_DB, "ETH")
-    build_sqlite_from_txt(SOL_TXT, SOL_DB, "SOL")
+    build_sqlite_from_txt(BTC_TXT, BTC_DB, "btc")
+    build_sqlite_from_txt(ETH_TXT, ETH_DB, "eth")
+    build_sqlite_from_txt(SOL_TXT, SOL_DB, "sol")
 
     btc_checker = AddressChecker(BTC_DB)
     eth_checker = AddressChecker(ETH_DB)
@@ -474,7 +479,7 @@ def main():
     stop_event = manager.Event()
 
     def _signal_handler(sig, frame):
-        print("\nInterrupt received. Setting stop event...")
+        print("interrupt")
         stop_event.set()
 
     signal.signal(signal.SIGINT, _signal_handler)
@@ -484,23 +489,22 @@ def main():
         scan_all_seeds(btc_checker, eth_checker, sol_checker, stop_event)
     except KeyboardInterrupt:
         interrupted = True
-        print("Scan interrupted — not advancing to next round.")
+        print("scan interrupted")
     finally:
         btc_checker.close()
         eth_checker.close()
         sol_checker.close()
 
     if interrupted:
-        print("Exiting without touching progress or valid_seeds.txt.")
+        print("exiting without finalizing")
         return
 
     finalize_round()
-
-    print(f"Total matches found: {match_counter}")
+    print(f"total matches: {match_counter}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("Graceful shutdown.")
+        print("shutdown")

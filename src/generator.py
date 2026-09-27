@@ -15,9 +15,9 @@ from supabase import create_client
 NUM_WORKERS = 40
 OUTPUT_FILE = "valid_seeds.txt"
 PART_DIR = "seed_parts"
-LOG_VALID_INTERVAL = 2_000_000
+LOG_VALID_INTERVAL = 3_000_000
 MAX_LOGS = 10
-FLUSH_EVERY = 500_000
+FLUSH_EVERY = 1_000_000
 STOP_CHECK_MASK = 0x3FFF
 MAX_PERMS = int(os.getenv("MAX_PERMS", "0"))
 
@@ -73,7 +73,7 @@ def get_progress_flag():
 
 def set_progress_flag(value):
     update_atomic({"progress": value})
-    print(f"Set atomic.progress = {value}.")
+    print(f"progress = {value}")
 
 
 def store_seed_phrase(seed_phrase):
@@ -91,45 +91,49 @@ def store_seed_phrase(seed_phrase):
     raise RuntimeError(f"Could not store seed phrase in atomic: {last_err}")
 
 
-def permutation_indices(base_indices, rank):
-    arr = list(base_indices)
-    k = rank
-    perm = [0] * 12
-    for j in range(12, 0, -1):
-        f = FACTORIALS[j - 1]
-        pos = k // f
-        k %= f
-        perm[12 - j] = arr.pop(pos)
-    return perm
-
-
-def checksum_ok(perm):
-    bits = 0
-    for i in perm:
-        bits = (bits << 11) | i
-    entropy = bits >> 4
-    checksum = bits & 0xF
-    expected = hashlib.sha256(entropy.to_bytes(16, "big")).digest()[0] >> 4
-    return checksum == expected
-
-
 def worker(start_idx, count, worker_id, stop_event, base_indices, part_file,
            done_counter, valid_counter, counter_lock, total_perms):
+    b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11 = base_indices
     written = 0
     last_flushed_done = 0
     last_flushed_valid = 0
 
+    f11, f10, f9, f8, f7, f6 = 39916800, 3628800, 362880, 40320, 5040, 720
+    f5, f4, f3, f2 = 120, 24, 6, 2
+
+    sha256 = hashlib.sha256
+    wordlist = WORDLIST
+    stop_is_set = stop_event.is_set
+
     with open(part_file, "w", encoding="utf-8") as f:
         for offset in range(count):
-            if (offset & STOP_CHECK_MASK) == 0 and stop_event.is_set():
+            if (offset & STOP_CHECK_MASK) == 0 and stop_is_set():
                 break
 
-            rank = start_idx + offset
-            perm = permutation_indices(base_indices, rank)
+            k = start_idx + offset
 
-            if checksum_ok(perm):
-                words = [WORDLIST[i] for i in perm]
-                f.write(" ".join(words) + "\n")
+            a = [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11]
+            i = k // f11; k -= i * f11; p0 = a.pop(i)
+            i = k // f10; k -= i * f10; p1 = a.pop(i)
+            i = k // f9;  k -= i * f9;  p2 = a.pop(i)
+            i = k // f8;  k -= i * f8;  p3 = a.pop(i)
+            i = k // f7;  k -= i * f7;  p4 = a.pop(i)
+            i = k // f6;  k -= i * f6;  p5 = a.pop(i)
+            i = k // f5;  k -= i * f5;  p6 = a.pop(i)
+            i = k // f4;  k -= i * f4;  p7 = a.pop(i)
+            i = k // f3;  k -= i * f3;  p8 = a.pop(i)
+            i = k // f2;  k -= i * f2;  p9 = a.pop(i)
+            p10 = a.pop(k)
+            p11 = a[0]
+
+            bits = (p0 << 121) | (p1 << 110) | (p2 << 99) | (p3 << 88) | \
+                   (p4 << 77) | (p5 << 66) | (p6 << 55) | (p7 << 44) | \
+                   (p8 << 33) | (p9 << 22) | (p10 << 11) | p11
+
+            if (bits & 0xF) == (sha256((bits >> 4).to_bytes(16, "big")).digest()[0] >> 4):
+                f.write(f"{wordlist[p0]} {wordlist[p1]} {wordlist[p2]} {wordlist[p3]} "
+                        f"{wordlist[p4]} {wordlist[p5]} {wordlist[p6]} {wordlist[p7]} "
+                        f"{wordlist[p8]} {wordlist[p9]} {wordlist[p10]} {wordlist[p11]}\n")
                 written += 1
 
             done = offset + 1
@@ -144,14 +148,13 @@ def worker(start_idx, count, worker_id, stop_event, base_indices, part_file,
                     prev_valid = valid_counter.value
                     new_valid = prev_valid + delta_valid
                     valid_counter.value = new_valid
-
                     prev_level = prev_valid // LOG_VALID_INTERVAL
                     new_level = new_valid // LOG_VALID_INTERVAL
                     should_log = (new_level > prev_level) and (new_level <= MAX_LOGS)
                     log_value = new_level * LOG_VALID_INTERVAL
 
                 if should_log:
-                    print(f"{log_value:,} valid seeds", flush=True)
+                    print(f"{log_value:,} valid", flush=True)
 
     return written
 
@@ -174,15 +177,14 @@ def run_permutations(seed_phrase):
     try:
         base_indices = [WORD_TO_IDX[w] for w in words]
     except KeyError as e:
-        print(f"ERROR: seed contains unknown word: {e}")
+        print(f"ERROR: unknown word in seed: {e}")
         sys.exit(1)
 
     total_perms = FACTORIALS[12]
     if MAX_PERMS > 0:
         total_perms = min(total_perms, MAX_PERMS)
 
-    print(f"Total permutations to test: {total_perms:,}")
-    print(f"Output file: {OUTPUT_FILE}")
+    print(f"perms: {total_perms:,}")
 
     os.makedirs(PART_DIR, exist_ok=True)
     for name in os.listdir(PART_DIR):
@@ -199,7 +201,7 @@ def run_permutations(seed_phrase):
     counter_lock = manager.Lock()
 
     def _signal_handler(sig, frame):
-        print("\nInterrupt received. Setting stop event...")
+        print("interrupt")
         stop_event.set()
 
     signal.signal(signal.SIGINT, _signal_handler)
@@ -217,8 +219,6 @@ def run_permutations(seed_phrase):
         tasks.append((start, count, w + 1, part_file))
         start += count
 
-    print(f"Launching {len(tasks)} workers...")
-
     t0 = time.time()
     total_valid = 0
 
@@ -233,9 +233,8 @@ def run_permutations(seed_phrase):
                 try:
                     total_valid += fut.result()
                 except Exception as e:
-                    print(f"Worker error: {e}")
+                    print(f"worker error: {e}")
         except KeyboardInterrupt:
-            print("Interrupted, waiting for workers to stop...")
             stop_event.set()
             for fut in futures:
                 try:
@@ -245,12 +244,11 @@ def run_permutations(seed_phrase):
 
     elapsed = time.time() - t0
     rate = total_perms / elapsed if elapsed else 0
-    print(f"Done in {elapsed:.1f}s ({rate:,.0f} perms/s). Valid seeds: {total_valid:,}")
 
-    print(f"Merging part files into {OUTPUT_FILE}...")
-    merged_lines = merge_parts([pf for (_, _, _, pf) in tasks], OUTPUT_FILE)
+    part_files = [pf for (_, _, _, pf) in tasks]
+    merged_lines = merge_parts(part_files, OUTPUT_FILE)
 
-    for (_, _, _, pf) in tasks:
+    for pf in part_files:
         try:
             if os.path.exists(pf):
                 os.remove(pf)
@@ -262,14 +260,12 @@ def run_permutations(seed_phrase):
         pass
 
     size_mb = os.path.getsize(OUTPUT_FILE) / (1024 * 1024)
-    print(f"Wrote {OUTPUT_FILE} ({size_mb:.2f} MB, {merged_lines:,} lines)")
+    print(f"done: {elapsed:.0f}s, {rate:,.0f}/s, valid={merged_lines:,}, {size_mb:.0f} MB")
 
 
 def should_run():
     flag = get_progress_flag()
     file_exists = os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0
-
-    print(f"atomic.progress = {flag!r}   valid_seeds.txt exists = {file_exists}")
 
     if flag is True:
         return True
@@ -281,26 +277,20 @@ def should_run():
 def main():
     row = get_atomic_row()
     if row is None:
-        print("ERROR: atomic table has no row with id=1. Run the SQL setup first.")
+        print("ERROR: atomic row id=1 missing")
         sys.exit(1)
 
     if not should_run():
-        print("Nothing to do — seed phrases already generated and awaiting scan.")
+        print("nothing to do")
         sys.exit(0)
 
     seed_phrase = MNEMO.generate(strength=128)
-    words = seed_phrase.split()
-    if len(words) != 12:
-        print(f"ERROR: expected 12 words, got {len(words)}")
-        sys.exit(1)
-
-    print(f"Seed phrase: {seed_phrase}")
+    print(f"seed: {seed_phrase}")
 
     try:
         store_seed_phrase(seed_phrase)
-        print("Stored seed phrase in atomic.seed_phrase.")
     except Exception as e:
-        print(f"ERROR: could not store seed phrase: {e}")
+        print(f"ERROR: store failed: {e}")
         sys.exit(1)
 
     set_progress_flag(False)
@@ -308,10 +298,8 @@ def main():
     try:
         run_permutations(seed_phrase)
     except Exception as e:
-        print(f"ERROR: permutation run failed: {e}")
+        print(f"ERROR: {e}")
         sys.exit(1)
-
-    print("Done.")
 
 
 if __name__ == "__main__":
