@@ -1,9 +1,7 @@
-google-auth
-mnemonic>=0.21
-bip-utils>=2.9.0
-supabase>=2.0.0
-google-api-python-client>=2.100.0
-google-auth-httplib2>=0.1.0
-google-auth-oauthlib>=1.0.0
-google-cloud-bigquery>=3.11.0
-google-cloud-storage>=2.10.0
+mnemonic>=0.21,<0.22
+bip-utils>=2.9.0,<3.0.0
+gdown>=5.1.0,<6.0.0
+supabase>=2.0.0,<3.0.0
+google-auth>=2.23.0
+google-api-python-client>=2.100.0,<3.0.0
+google-cloud-bigquery>=3.11.0,<4.0.0
