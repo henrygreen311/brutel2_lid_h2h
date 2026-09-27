@@ -6,6 +6,7 @@ import sys
 import math
 import signal
 import time
+import hashlib
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from mnemonic import Mnemonic
@@ -14,11 +15,17 @@ from supabase import create_client
 NUM_WORKERS = 40
 OUTPUT_FILE = "valid_seeds.txt"
 PART_DIR = "seed_parts"
-LOG_INTERVAL = 2_000_000
-FLUSH_EVERY = 100_000
+LOG_VALID_INTERVAL = 2_000_000
+MAX_LOGS = 10
+FLUSH_EVERY = 200_000
 MAX_PERMS = int(os.getenv("MAX_PERMS", "0"))
 
 ATOMIC_ID = 1
+
+MNEMO = Mnemonic("english")
+WORDLIST = MNEMO.wordlist
+WORD_TO_IDX = {w: i for i, w in enumerate(WORDLIST)}
+FACTORIALS = [math.factorial(i) for i in range(13)]
 
 
 def load_db_config():
@@ -83,21 +90,30 @@ def store_seed_phrase(seed_phrase):
     raise RuntimeError(f"Could not store seed phrase in atomic: {last_err}")
 
 
-def permutation_at(words, idx):
-    arr = words[:]
-    k = idx
-    perm = []
-    for j in range(len(arr), 0, -1):
-        fact = math.factorial(j - 1)
-        pos = k // fact
-        k %= fact
-        perm.append(arr.pop(pos))
+def permutation_indices(base_indices, rank):
+    arr = list(base_indices)
+    k = rank
+    perm = [0] * 12
+    for j in range(12, 0, -1):
+        f = FACTORIALS[j - 1]
+        pos = k // f
+        k %= f
+        perm[12 - j] = arr.pop(pos)
     return perm
 
 
-def worker(start_idx, count, worker_id, stop_event, words, part_file,
+def checksum_ok(perm):
+    bits = 0
+    for i in perm:
+        bits = (bits << 11) | i
+    entropy = bits >> 4
+    checksum = bits & 0xF
+    expected = hashlib.sha256(entropy.to_bytes(16, "big")).digest()[0] >> 4
+    return checksum == expected
+
+
+def worker(start_idx, count, worker_id, stop_event, base_indices, part_file,
            done_counter, valid_counter, counter_lock, total_perms):
-    mnemo = Mnemonic("english")
     written = 0
     last_flushed_done = 0
     last_flushed_valid = 0
@@ -106,11 +122,12 @@ def worker(start_idx, count, worker_id, stop_event, words, part_file,
         for offset in range(count):
             if stop_event.is_set():
                 break
-            idx = start_idx + offset
-            perm = permutation_at(words, idx)
-            mnemonic = " ".join(perm)
-            if mnemo.check(mnemonic):
-                f.write(mnemonic + "\n")
+            rank = start_idx + offset
+            perm = permutation_indices(base_indices, rank)
+
+            if checksum_ok(perm):
+                words = [WORDLIST[i] for i in perm]
+                f.write(" ".join(words) + "\n")
                 written += 1
 
             done = offset + 1
@@ -121,16 +138,18 @@ def worker(start_idx, count, worker_id, stop_event, words, part_file,
                 last_flushed_valid = written
 
                 with counter_lock:
-                    prev_total = done_counter.value
-                    new_total = prev_total + delta_done
-                    done_counter.value = new_total
-                    valid_counter.value += delta_valid
-                    log_now = (prev_total // LOG_INTERVAL) < (new_total // LOG_INTERVAL)
-                    valid_snapshot = valid_counter.value
+                    done_counter.value += delta_done
+                    prev_valid = valid_counter.value
+                    new_valid = prev_valid + delta_valid
+                    valid_counter.value = new_valid
 
-                if log_now:
-                    pct = 100.0 * new_total / total_perms if total_perms else 0.0
-                    print(f"Progress: {new_total:,}/{total_perms:,} ({pct:.1f}%)  valid={valid_snapshot:,}", flush=True)
+                    prev_level = prev_valid // LOG_VALID_INTERVAL
+                    new_level = new_valid // LOG_VALID_INTERVAL
+                    should_log = (new_level > prev_level) and (new_level <= MAX_LOGS)
+                    log_value = new_level * LOG_VALID_INTERVAL
+
+                if should_log:
+                    print(f"{log_value:,} valid seeds", flush=True)
 
     return written
 
@@ -148,8 +167,15 @@ def merge_parts(part_files, output_path):
     return total_lines
 
 
-def run_permutations(words):
-    total_perms = math.factorial(len(words))
+def run_permutations(seed_phrase):
+    words = seed_phrase.split()
+    try:
+        base_indices = [WORD_TO_IDX[w] for w in words]
+    except KeyError as e:
+        print(f"ERROR: seed contains unknown word: {e}")
+        sys.exit(1)
+
+    total_perms = FACTORIALS[12]
     if MAX_PERMS > 0:
         total_perms = min(total_perms, MAX_PERMS)
 
@@ -196,7 +222,7 @@ def run_permutations(words):
 
     with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
         futures = [
-            executor.submit(worker, s, c, wid, stop_event, words, pf,
+            executor.submit(worker, s, c, wid, stop_event, base_indices, pf,
                             done_counter, valid_counter, counter_lock, total_perms)
             for (s, c, wid, pf) in tasks
         ]
@@ -216,7 +242,8 @@ def run_permutations(words):
                     pass
 
     elapsed = time.time() - t0
-    print(f"All workers finished in {elapsed:.1f}s. Total valid seeds: {total_valid:,}")
+    rate = total_perms / elapsed if elapsed else 0
+    print(f"Done in {elapsed:.1f}s ({rate:,.0f} perms/s). Valid seeds: {total_valid:,}")
 
     print(f"Merging part files into {OUTPUT_FILE}...")
     merged_lines = merge_parts([pf for (_, _, _, pf) in tasks], OUTPUT_FILE)
@@ -259,9 +286,7 @@ def main():
         print("Nothing to do — seed phrases already generated and awaiting scan.")
         sys.exit(0)
 
-    mnemo = Mnemonic("english")
-
-    seed_phrase = mnemo.generate(strength=128)
+    seed_phrase = MNEMO.generate(strength=128)
     words = seed_phrase.split()
     if len(words) != 12:
         print(f"ERROR: expected 12 words, got {len(words)}")
@@ -279,7 +304,7 @@ def main():
     set_progress_flag(False)
 
     try:
-        run_permutations(words)
+        run_permutations(seed_phrase)
     except Exception as e:
         print(f"ERROR: permutation run failed: {e}")
         sys.exit(1)
