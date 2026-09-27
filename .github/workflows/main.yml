@@ -1,30 +1,16 @@
-name: btc-export
+name: brute-generator
 
 on:
+  repository_dispatch:
+    types: [run-brute2]
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "Mode: export (build DB), finalize (dump .txt + delete DB), status"
-        required: true
-        default: "finalize"
-        type: choice
-        options: [export, finalize, status]
 
 jobs:
-  run:
+  run-generator:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 358
 
     steps:
-      - name: Log runner resources (before)
-        run: |
-          echo "--- CPU ---"
-          nproc
-          echo "--- RAM ---"
-          free -h
-          echo "--- Disk ---"
-          df -h
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -32,40 +18,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Log runner resources (after install)
         run: |
-          echo "--- RAM ---"
-          free -h
-          echo "--- Disk ---"
-          df -h
+          pip install -r requirements.txt
 
-      - name: Run BTC exporter
+      - name: Run brute with timeout
         env:
           PYTHONUNBUFFERED: "1"
-          MODE: ${{ inputs.mode }}
+          PYTHONIOENCODING: "utf-8"
         run: |
-          echo "Selected mode: $MODE"
-          case "$MODE" in
-            finalize)
-              python3 main.py --finalize --cleanup
-              ;;
-            status)
-              python3 main.py --status
-              ;;
-            export|*)
-              python3 main.py
-              ;;
-          esac
-
-      - name: Log runner resources (after run)
-        if: always()
-        run: |
-          echo "--- RAM ---"
-          free -h
-          echo "--- Disk ---"
-          df -h
+          timeout 355m python3 -u src/brute.py || true
