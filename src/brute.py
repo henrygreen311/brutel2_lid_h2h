@@ -13,10 +13,13 @@ import logging
 import contextlib
 import urllib.request
 import urllib.parse
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import gdown
 from mnemonic import Mnemonic
 from bip_utils import (
     Bip39SeedGenerator,
+    Bip32Slip10Ed25519,
     Bip44,
     Bip44Coins,
     Bip44Changes,
@@ -30,6 +33,9 @@ from supabase import create_client
 
 Bip44Conf.ENABLE_UNSAFE_HDWALLET = True
 
+# ----------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------
 BTC_FILE_ID = "1rysnhDGWd6OxtqbjHy-UEiDt6VDBsbAI"
 ETH_FILE_ID = "1G9CCyNnDoTxvQhqdQxYkbPG-HV2WN-Fx"
 SOL_FILE_ID = "1_ILIimHqOzws0Ld3IteMcH1_Rww9a-Ic"
@@ -49,9 +55,21 @@ GENERATOR_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen
 
 ATOMIC_ID = 1
 TELEGRAM_MESSAGE_LIMIT = 4000
-SCAN_LOG_INTERVAL = 300
+NUM_WORKERS = 50
+LOOKUP_LOG_EVERY = 5_000_000
+STOP_CHECK_MASK = 0xFFF
+
+SOL_DERIVATION_PATH = "m/44'/501'/0'/0'"
+
+SEEDS = []
+
+_telegram_bot_id = None
+_telegram_chat_id = None
 
 
+# ----------------------------------------------------------------------
+# Silent third-party loggers
+# ----------------------------------------------------------------------
 class NullHandler(logging.Handler):
     def emit(self, record):
         pass
@@ -65,14 +83,10 @@ logger.setLevel(logging.CRITICAL)
 logging.getLogger("aiohttp").setLevel(logging.CRITICAL)
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
-mnemo = Mnemonic("english")
-scanned_counter = 0
-match_counter = 0
 
-_telegram_bot_id = None
-_telegram_chat_id = None
-
-
+# ----------------------------------------------------------------------
+# DB / Supabase helpers
+# ----------------------------------------------------------------------
 def load_db_config():
     here = os.path.dirname(os.path.abspath(__file__))
     for path in (
@@ -115,24 +129,7 @@ def set_progress_flag(value):
         update_atomic({"progress": value})
         print(f"progress = {value}")
     except Exception as e:
-        print(f"WARN: could not set progress: {e}")
-
-
-def load_telegram_config():
-    global _telegram_bot_id, _telegram_chat_id
-    try:
-        row = get_atomic_row()
-        if row and row.get("telegram"):
-            cfg = row["telegram"]
-            if isinstance(cfg, dict):
-                _telegram_bot_id = cfg.get("bot_id")
-                _telegram_chat_id = cfg.get("chat_id")
-        if _telegram_bot_id and _telegram_chat_id:
-            print(f"telegram on (chat={_telegram_chat_id})")
-        else:
-            print("telegram off")
-    except Exception as e:
-        print(f"WARN: telegram config: {e}")
+        print(f"WARN: set progress: {e}")
 
 
 def append_found_record(record):
@@ -151,11 +148,31 @@ def append_found_record(record):
         except Exception as e:
             last_err = e
             wait = min(2 ** attempt, 30)
-            print(f"WARN: append_found failed ({attempt}/5): {e}")
+            print(f"WARN: append_found {attempt}/5: {e}")
             if attempt < 5:
                 time.sleep(wait)
-    print(f"WARN: giving up on append_found: {last_err}")
+    print(f"WARN: append_found gave up: {last_err}")
     return False
+
+
+# ----------------------------------------------------------------------
+# Telegram
+# ----------------------------------------------------------------------
+def load_telegram_config():
+    global _telegram_bot_id, _telegram_chat_id
+    try:
+        row = get_atomic_row()
+        if row and row.get("telegram"):
+            cfg = row["telegram"]
+            if isinstance(cfg, dict):
+                _telegram_bot_id = cfg.get("bot_id")
+                _telegram_chat_id = cfg.get("chat_id")
+        if _telegram_bot_id and _telegram_chat_id:
+            print(f"telegram on (chat={_telegram_chat_id})")
+        else:
+            print("telegram off")
+    except Exception as e:
+        print(f"WARN: telegram config: {e}")
 
 
 def _telegram_post(url, payload, timeout=15):
@@ -198,6 +215,9 @@ def send_telegram_alert(coin, seed, address, extra=None):
     return ok
 
 
+# ----------------------------------------------------------------------
+# Google Drive download (public files)
+# ----------------------------------------------------------------------
 def download_public_drive_file(file_id, local_path, label):
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
         size_mb = os.path.getsize(local_path) / (1024 * 1024)
@@ -221,60 +241,9 @@ def download_public_drive_file(file_id, local_path, label):
     return local_path
 
 
-def derive_btc_addresses(seed_phrase):
-    results = []
-    try:
-        seed_bytes = Bip39SeedGenerator(seed_phrase).Generate()
-    except Exception:
-        return results
-
-    try:
-        addr = Bip44.FromSeed(seed_bytes, Bip44Coins.BITCOIN) \
-            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
-            .AddressIndex(0).PublicKey().ToAddress()
-        results.append(("p2pkh", addr))
-    except Exception:
-        pass
-
-    try:
-        addr = Bip49.FromSeed(seed_bytes, Bip49Coins.BITCOIN) \
-            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
-            .AddressIndex(0).PublicKey().ToAddress()
-        results.append(("p2sh", addr))
-    except Exception:
-        pass
-
-    try:
-        addr = Bip84.FromSeed(seed_bytes, Bip84Coins.BITCOIN) \
-            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
-            .AddressIndex(0).PublicKey().ToAddress()
-        results.append(("bech32", addr))
-    except Exception:
-        pass
-
-    return results
-
-
-def derive_eth_address(seed_phrase):
-    try:
-        seed_bytes = Bip39SeedGenerator(seed_phrase).Generate()
-        return Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM) \
-            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
-            .AddressIndex(0).PublicKey().ToAddress()
-    except Exception:
-        return None
-
-
-def derive_sol_address(seed_phrase):
-    try:
-        seed_bytes = Bip39SeedGenerator(seed_phrase).Generate()
-        return Bip44.FromSeed(seed_bytes, Bip44Coins.SOLANA) \
-            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
-            .PublicKey().ToAddress()
-    except Exception:
-        return None
-
-
+# ----------------------------------------------------------------------
+# SQLite: build index from text file
+# ----------------------------------------------------------------------
 def build_sqlite_from_txt(txt_path, db_path, label):
     if os.path.exists(db_path) and os.path.getsize(db_path) > 0:
         conn = sqlite3.connect(db_path)
@@ -320,13 +289,15 @@ class AddressChecker:
     def __init__(self, db_path):
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA query_only = ON")
-        self.conn.execute("PRAGMA cache_size=-500000")
+        self.conn.execute("PRAGMA cache_size=-1000000")
         self._cur = self.conn.cursor()
 
     def contains(self, address):
         if not address:
             return False
-        self._cur.execute("SELECT 1 FROM addresses WHERE address = ? LIMIT 1", (address,))
+        self._cur.execute(
+            "SELECT 1 FROM addresses WHERE address = ? LIMIT 1", (address,)
+        )
         return self._cur.fetchone() is not None
 
     def close(self):
@@ -336,10 +307,10 @@ class AddressChecker:
             pass
 
 
+# ----------------------------------------------------------------------
+# Match recording
+# ----------------------------------------------------------------------
 def log_match(coin, seed, address, extra=None):
-    global match_counter
-    match_counter += 1
-
     record = {
         "coin": coin,
         "seed": seed,
@@ -357,10 +328,276 @@ def log_match(coin, seed, address, extra=None):
 
     append_found_record(record)
     send_telegram_alert(coin, seed, address, extra=extra)
-
     print(f"MATCH [{coin}] {address} <- {seed}")
 
 
+# ----------------------------------------------------------------------
+# Address derivation
+# ----------------------------------------------------------------------
+def derive_btc_addresses(seed_bytes):
+    """
+    BTC addresses:
+      BIP44  m/44'/0'/0'/0/0  -> P2PKH   (1...)
+      BIP49  m/49'/0'/0'/0/0  -> P2SH    (3...)
+      BIP84  m/84'/0'/0'/0/0  -> bech32  (bc1...)
+    """
+    results = []
+
+    try:
+        addr = Bip44.FromSeed(seed_bytes, Bip44Coins.BITCOIN) \
+            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
+            .AddressIndex(0).PublicKey().ToAddress()
+        results.append(("p2pkh", addr))
+    except Exception:
+        pass
+
+    try:
+        addr = Bip49.FromSeed(seed_bytes, Bip49Coins.BITCOIN) \
+            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
+            .AddressIndex(0).PublicKey().ToAddress()
+        results.append(("p2sh", addr))
+    except Exception:
+        pass
+
+    try:
+        addr = Bip84.FromSeed(seed_bytes, Bip84Coins.BITCOIN) \
+            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
+            .AddressIndex(0).PublicKey().ToAddress()
+        results.append(("bech32", addr))
+    except Exception:
+        pass
+
+    return results
+
+
+def derive_eth_address(seed_bytes):
+    """
+    ETH address at standard BIP44 path:
+      m/44'/60'/0'/0/0
+    """
+    try:
+        return Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM) \
+            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
+            .AddressIndex(0).PublicKey().ToAddress()
+    except Exception:
+        return None
+
+
+def derive_sol_address(seed_bytes):
+    """
+    Solana address at the Phantom / Solflare / standard wallet path:
+
+        m/44'/501'/0'/0'
+
+    Solana keys are ed25519 and follow SLIP-0010, not BIP32 secp256k1.
+    SLIP-0010 requires every derivation level to be hardened, so all four
+    levels use ' (hardened). This is derived with Bip32Slip10Ed25519 —
+    using Bip44/Bip44Coins.SOLANA would yield a different (unhardened
+    change level) address and would not match wallet software.
+    """
+    try:
+        ctx = Bip32Slip10Ed25519.FromSeed(seed_bytes)
+        derived = ctx.DerivePath(SOL_DERIVATION_PATH)
+        return derived.PublicKey().ToAddress()
+    except Exception:
+        return None
+
+
+# ----------------------------------------------------------------------
+# Per-worker derivation (one per phase)
+# ----------------------------------------------------------------------
+def derive_worker_btc(args):
+    worker_id, start_idx, count, stop_event = args
+    path = f"temp_btc_w{worker_id:02d}.txt"
+    written = 0
+
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(start_idx, start_idx + count):
+            if (i - start_idx) & STOP_CHECK_MASK == 0 and stop_event.is_set():
+                break
+            seed = SEEDS[i]
+            try:
+                seed_bytes = Bip39SeedGenerator(seed).Generate()
+            except Exception:
+                continue
+            for _typ, addr in derive_btc_addresses(seed_bytes):
+                f.write(f"{addr}\t{seed}\n")
+                written += 1
+
+    return path, written
+
+
+def derive_worker_eth(args):
+    worker_id, start_idx, count, stop_event = args
+    path = f"temp_eth_w{worker_id:02d}.txt"
+    written = 0
+
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(start_idx, start_idx + count):
+            if (i - start_idx) & STOP_CHECK_MASK == 0 and stop_event.is_set():
+                break
+            seed = SEEDS[i]
+            try:
+                seed_bytes = Bip39SeedGenerator(seed).Generate()
+            except Exception:
+                continue
+            addr = derive_eth_address(seed_bytes)
+            if addr:
+                f.write(f"{addr}\t{seed}\n")
+                written += 1
+
+    return path, written
+
+
+def derive_worker_sol(args):
+    worker_id, start_idx, count, stop_event = args
+    path = f"temp_sol_w{worker_id:02d}.txt"
+    written = 0
+
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(start_idx, start_idx + count):
+            if (i - start_idx) & STOP_CHECK_MASK == 0 and stop_event.is_set():
+                break
+            seed = SEEDS[i]
+            try:
+                seed_bytes = Bip39SeedGenerator(seed).Generate()
+            except Exception:
+                continue
+            addr = derive_sol_address(seed_bytes)
+            if addr:
+                f.write(f"{addr}\t{seed}\n")
+                written += 1
+
+    return path, written
+
+
+# ----------------------------------------------------------------------
+# Per-phase runner: derive -> lookup -> cleanup
+# ----------------------------------------------------------------------
+def run_derivation_phase(worker_fn, seeds, stop_event, coin):
+    total = len(seeds)
+    chunk = total // NUM_WORKERS
+    remainder = total % NUM_WORKERS
+
+    tasks = []
+    start = 0
+    for w in range(NUM_WORKERS):
+        count = chunk + (1 if w < remainder else 0)
+        if count == 0:
+            continue
+        tasks.append((w, start, count, stop_event))
+        start += count
+
+    produced = []
+    t0 = time.time()
+    total_written = 0
+
+    ctx = mp.get_context("fork")
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS, mp_context=ctx) as executor:
+        futures = [executor.submit(worker_fn, t) for t in tasks]
+        try:
+            for fut in as_completed(futures):
+                try:
+                    path, written = fut.result()
+                    produced.append(path)
+                    total_written += written
+                except Exception as e:
+                    print(f"{coin} worker error: {e}")
+        except KeyboardInterrupt:
+            stop_event.set()
+            for fut in futures:
+                try:
+                    fut.result(timeout=10)
+                except Exception:
+                    pass
+
+    elapsed = time.time() - t0
+    rate = total_written / elapsed if elapsed else 0
+    print(f"{coin} derived: {total_written:,} addresses in {elapsed:.0f}s ({rate:,.0f}/s)")
+
+    return produced
+
+
+def cleanup_temp_file(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        print(f"WARN: delete {path}: {e}")
+
+
+def lookup_addresses(temp_files, db_path, coin):
+    if not temp_files:
+        print(f"{coin} lookup: no temp files")
+        return 0
+
+    checker = AddressChecker(db_path)
+    total_lines = 0
+    matches = 0
+    last_log = 0
+    t0 = time.time()
+
+    try:
+        for path in temp_files:
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    addr, _, seed = line.partition("\t")
+                    total_lines += 1
+
+                    if checker.contains(addr):
+                        log_match(coin, seed, addr)
+                        matches += 1
+
+                    if total_lines - last_log >= LOOKUP_LOG_EVERY:
+                        rate = total_lines / (time.time() - t0)
+                        print(f"  {coin}: {total_lines:,} ({rate:,.0f}/s, {matches} hits)")
+                        last_log = total_lines
+
+            cleanup_temp_file(path)
+    finally:
+        checker.close()
+
+    elapsed = time.time() - t0
+    rate = total_lines / elapsed if elapsed else 0
+    print(f"{coin} lookup: {total_lines:,} in {elapsed:.0f}s ({rate:,.0f}/s), {matches} hits")
+    return matches
+
+
+# ----------------------------------------------------------------------
+# Blockchain phases
+# ----------------------------------------------------------------------
+def process_btc(seeds, stop_event):
+    print("=== BTC phase ===")
+    files = run_derivation_phase(derive_worker_btc, seeds, stop_event, "BTC")
+    matches = lookup_addresses(files, BTC_DB, "BTC")
+    print("=== BTC phase done ===")
+    return matches
+
+
+def process_eth(seeds, stop_event):
+    print("=== ETH phase ===")
+    files = run_derivation_phase(derive_worker_eth, seeds, stop_event, "ETH")
+    matches = lookup_addresses(files, ETH_DB, "ETH")
+    print("=== ETH phase done ===")
+    return matches
+
+
+def process_sol(seeds, stop_event):
+    print("=== SOL phase ===")
+    files = run_derivation_phase(derive_worker_sol, seeds, stop_event, "SOL")
+    matches = lookup_addresses(files, SOL_DB, "SOL")
+    print("=== SOL phase done ===")
+    return matches
+
+
+# ----------------------------------------------------------------------
+# Round orchestration
+# ----------------------------------------------------------------------
 def ensure_valid_seeds():
     if os.path.exists(VALID_SEEDS_FILE) and os.path.getsize(VALID_SEEDS_FILE) > 0:
         return True
@@ -377,7 +614,7 @@ def ensure_valid_seeds():
 
 
 def call_generator_for_next_round():
-    print("calling generator for next round")
+    print("calling generator")
     try:
         result = subprocess.run([sys.executable, GENERATOR_SCRIPT], check=False)
         if result.returncode != 0:
@@ -401,52 +638,11 @@ def finalize_round():
     call_generator_for_next_round()
 
 
-def scan_all_seeds(btc_checker, eth_checker, sol_checker, stop_event):
-    global scanned_counter, match_counter
-    scanned_counter = 0
-    match_counter = 0
-
-    with open(VALID_SEEDS_FILE, "r", encoding="utf-8") as f:
-        seeds = [line.strip() for line in f if line.strip()]
-
-    total = len(seeds)
-    print(f"scanning {total:,}")
-
-    t0 = time.time()
-    last_log = t0
-    for idx, seed in enumerate(seeds, 1):
-        if stop_event.is_set():
-            print("stop signal")
-            break
-
-        btc_addrs = derive_btc_addresses(seed)
-        for addr_type, addr in btc_addrs:
-            if btc_checker.contains(addr):
-                log_match("BTC", seed, addr, extra=addr_type)
-
-        eth_addr = derive_eth_address(seed)
-        if eth_addr and eth_checker.contains(eth_addr):
-            log_match("ETH", seed, eth_addr)
-
-        sol_addr = derive_sol_address(seed)
-        if sol_addr and sol_checker.contains(sol_addr):
-            log_match("SOL", seed, sol_addr)
-
-        scanned_counter += 1
-        now = time.time()
-        if now - last_log >= SCAN_LOG_INTERVAL:
-            rate = idx / (now - t0) if (now - t0) else 0
-            print(f"scanned {idx:,}/{total:,} ({rate:,.0f}/s, {match_counter} hits)")
-            last_log = now
-
-    elapsed = time.time() - t0
-    rate = scanned_counter / elapsed if elapsed else 0
-    print(f"scan done: {scanned_counter:,} in {elapsed:.0f}s ({rate:,.0f}/s), {match_counter} hits")
-    return scanned_counter, match_counter
-
-
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 def main():
-    global match_counter
+    global SEEDS
 
     row = get_atomic_row()
     if row is None:
@@ -470,11 +666,15 @@ def main():
     build_sqlite_from_txt(ETH_TXT, ETH_DB, "eth")
     build_sqlite_from_txt(SOL_TXT, SOL_DB, "sol")
 
-    btc_checker = AddressChecker(BTC_DB)
-    eth_checker = AddressChecker(ETH_DB)
-    sol_checker = AddressChecker(SOL_DB)
+    with open(VALID_SEEDS_FILE, "r", encoding="utf-8") as f:
+        SEEDS = [line.strip() for line in f if line.strip()]
 
-    import multiprocessing as mp
+    if not SEEDS:
+        print("ERROR: no seeds")
+        sys.exit(1)
+
+    print(f"loaded {len(SEEDS):,} seeds; {NUM_WORKERS} workers per phase")
+
     manager = mp.Manager()
     stop_event = manager.Event()
 
@@ -484,23 +684,26 @@ def main():
 
     signal.signal(signal.SIGINT, _signal_handler)
 
-    interrupted = False
-    try:
-        scan_all_seeds(btc_checker, eth_checker, sol_checker, stop_event)
-    except KeyboardInterrupt:
-        interrupted = True
-        print("scan interrupted")
-    finally:
-        btc_checker.close()
-        eth_checker.close()
-        sol_checker.close()
+    total_matches = 0
 
-    if interrupted:
-        print("exiting without finalizing")
-        return
+    try:
+        total_matches += process_btc(SEEDS, stop_event)
+        if stop_event.is_set():
+            print("stopped after BTC")
+            sys.exit(1)
+
+        total_matches += process_eth(SEEDS, stop_event)
+        if stop_event.is_set():
+            print("stopped after ETH")
+            sys.exit(1)
+
+        total_matches += process_sol(SEEDS, stop_event)
+    except KeyboardInterrupt:
+        print("interrupted")
+        sys.exit(1)
 
     finalize_round()
-    print(f"total matches: {match_counter}")
+    print(f"total matches: {total_matches}")
 
 
 if __name__ == "__main__":
