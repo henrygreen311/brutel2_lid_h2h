@@ -10,6 +10,7 @@ import signal
 import sqlite3
 import subprocess
 import logging
+import threading
 import contextlib
 import urllib.request
 import urllib.parse
@@ -58,18 +59,24 @@ TELEGRAM_MESSAGE_LIMIT = 4000
 NUM_WORKERS = 50
 LOOKUP_LOG_EVERY = 5_000_000
 STOP_CHECK_MASK = 0xFFF
+PROGRESS_FLUSH_EVERY = 50_000
+MONITOR_INTERVAL = 30
+DERIVE_LOG_EVERY = 2_000_000
 
 SOL_DERIVATION_PATH = "m/44'/501'/0'/0'"
 
+# Module globals — set before any process pool is created.
+# Forked children inherit these via copy-on-write.
 SEEDS = []
+_STOP_EVENT = None
+_PHASE_COUNTER = None
+_PHASE_LOCK = None
+_DERIVE_LOG_COUNTER = None
 
 _telegram_bot_id = None
 _telegram_chat_id = None
 
 
-# ----------------------------------------------------------------------
-# Silent third-party loggers
-# ----------------------------------------------------------------------
 class NullHandler(logging.Handler):
     def emit(self, record):
         pass
@@ -85,7 +92,7 @@ logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
 
 # ----------------------------------------------------------------------
-# DB / Supabase helpers
+# DB / Supabase
 # ----------------------------------------------------------------------
 def load_db_config():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -216,7 +223,7 @@ def send_telegram_alert(coin, seed, address, extra=None):
 
 
 # ----------------------------------------------------------------------
-# Google Drive download (public files)
+# Downloads
 # ----------------------------------------------------------------------
 def download_public_drive_file(file_id, local_path, label):
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
@@ -242,7 +249,7 @@ def download_public_drive_file(file_id, local_path, label):
 
 
 # ----------------------------------------------------------------------
-# SQLite: build index from text file
+# SQLite
 # ----------------------------------------------------------------------
 def build_sqlite_from_txt(txt_path, db_path, label):
     if os.path.exists(db_path) and os.path.getsize(db_path) > 0:
@@ -308,7 +315,7 @@ class AddressChecker:
 
 
 # ----------------------------------------------------------------------
-# Match recording
+# Matches
 # ----------------------------------------------------------------------
 def log_match(coin, seed, address, extra=None):
     record = {
@@ -332,14 +339,13 @@ def log_match(coin, seed, address, extra=None):
 
 
 # ----------------------------------------------------------------------
-# Address derivation
+# Derivation
 # ----------------------------------------------------------------------
 def derive_btc_addresses(seed_bytes):
     """
-    BTC addresses:
-      BIP44  m/44'/0'/0'/0/0  -> P2PKH   (1...)
-      BIP49  m/49'/0'/0'/0/0  -> P2SH    (3...)
-      BIP84  m/84'/0'/0'/0/0  -> bech32  (bc1...)
+    BIP44 m/44'/0'/0'/0/0  -> P2PKH  (1...)
+    BIP49 m/49'/0'/0'/0/0  -> P2SH   (3...)
+    BIP84 m/84'/0'/0'/0/0  -> bech32 (bc1...)
     """
     results = []
 
@@ -372,8 +378,7 @@ def derive_btc_addresses(seed_bytes):
 
 def derive_eth_address(seed_bytes):
     """
-    ETH address at standard BIP44 path:
-      m/44'/60'/0'/0/0
+    BIP44 m/44'/60'/0'/0/0 -> Ethereum address (0x...)
     """
     try:
         return Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM) \
@@ -385,15 +390,9 @@ def derive_eth_address(seed_bytes):
 
 def derive_sol_address(seed_bytes):
     """
-    Solana address at the Phantom / Solflare / standard wallet path:
-
+    Solana ed25519 (SLIP-0010) at standard wallet path:
         m/44'/501'/0'/0'
-
-    Solana keys are ed25519 and follow SLIP-0010, not BIP32 secp256k1.
-    SLIP-0010 requires every derivation level to be hardened, so all four
-    levels use ' (hardened). This is derived with Bip32Slip10Ed25519 —
-    using Bip44/Bip44Coins.SOLANA would yield a different (unhardened
-    change level) address and would not match wallet software.
+    All levels hardened.
     """
     try:
         ctx = Bip32Slip10Ed25519.FromSeed(seed_bytes)
@@ -404,77 +403,124 @@ def derive_sol_address(seed_bytes):
 
 
 # ----------------------------------------------------------------------
-# Per-worker derivation (one per phase)
+# Workers — read SEEDS / _STOP_EVENT / _PHASE_COUNTER via module globals
 # ----------------------------------------------------------------------
+def _bump_progress(n):
+    with _PHASE_LOCK:
+        prev = _PHASE_COUNTER.value
+        new = prev + n
+        _PHASE_COUNTER.value = new
+        # Parent-visible derive log cadence
+        prev_level = prev // DERIVE_LOG_EVERY
+        new_level = new // DERIVE_LOG_EVERY
+        log_now = new_level > prev_level
+    return log_now, new
+
+
 def derive_worker_btc(args):
-    worker_id, start_idx, count, stop_event = args
+    worker_id, start_idx, count = args
     path = f"temp_btc_w{worker_id:02d}.txt"
     written = 0
+    since_flush = 0
 
     with open(path, "w", encoding="utf-8") as f:
-        for i in range(start_idx, start_idx + count):
-            if (i - start_idx) & STOP_CHECK_MASK == 0 and stop_event.is_set():
+        for offset in range(count):
+            if (offset & STOP_CHECK_MASK) == 0 and _STOP_EVENT.is_set():
                 break
-            seed = SEEDS[i]
+            seed = SEEDS[start_idx + offset]
             try:
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
+                since_flush += 1
                 continue
             for _typ, addr in derive_btc_addresses(seed_bytes):
                 f.write(f"{addr}\t{seed}\n")
                 written += 1
 
+            since_flush += 1
+            if since_flush >= PROGRESS_FLUSH_EVERY:
+                _bump_progress(since_flush)
+                since_flush = 0
+
+        if since_flush:
+            _bump_progress(since_flush)
+
     return path, written
 
 
 def derive_worker_eth(args):
-    worker_id, start_idx, count, stop_event = args
+    worker_id, start_idx, count = args
     path = f"temp_eth_w{worker_id:02d}.txt"
     written = 0
+    since_flush = 0
 
     with open(path, "w", encoding="utf-8") as f:
-        for i in range(start_idx, start_idx + count):
-            if (i - start_idx) & STOP_CHECK_MASK == 0 and stop_event.is_set():
+        for offset in range(count):
+            if (offset & STOP_CHECK_MASK) == 0 and _STOP_EVENT.is_set():
                 break
-            seed = SEEDS[i]
+            seed = SEEDS[start_idx + offset]
             try:
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
+                since_flush += 1
                 continue
             addr = derive_eth_address(seed_bytes)
             if addr:
                 f.write(f"{addr}\t{seed}\n")
                 written += 1
 
+            since_flush += 1
+            if since_flush >= PROGRESS_FLUSH_EVERY:
+                _bump_progress(since_flush)
+                since_flush = 0
+
+        if since_flush:
+            _bump_progress(since_flush)
+
     return path, written
 
 
 def derive_worker_sol(args):
-    worker_id, start_idx, count, stop_event = args
+    worker_id, start_idx, count = args
     path = f"temp_sol_w{worker_id:02d}.txt"
     written = 0
+    since_flush = 0
 
     with open(path, "w", encoding="utf-8") as f:
-        for i in range(start_idx, start_idx + count):
-            if (i - start_idx) & STOP_CHECK_MASK == 0 and stop_event.is_set():
+        for offset in range(count):
+            if (offset & STOP_CHECK_MASK) == 0 and _STOP_EVENT.is_set():
                 break
-            seed = SEEDS[i]
+            seed = SEEDS[start_idx + offset]
             try:
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
+                since_flush += 1
                 continue
             addr = derive_sol_address(seed_bytes)
             if addr:
                 f.write(f"{addr}\t{seed}\n")
                 written += 1
 
+            since_flush += 1
+            if since_flush >= PROGRESS_FLUSH_EVERY:
+                _bump_progress(since_flush)
+                since_flush = 0
+
+        if since_flush:
+            _bump_progress(since_flush)
+
     return path, written
 
 
 # ----------------------------------------------------------------------
-# Per-phase runner: derive -> lookup -> cleanup
+# Phase runner
 # ----------------------------------------------------------------------
 def run_derivation_phase(worker_fn, seeds, stop_event, coin):
+    global _STOP_EVENT, _PHASE_COUNTER, _PHASE_LOCK
+    _STOP_EVENT = stop_event
+    _PHASE_COUNTER = mp.Value("q", 0)
+    _PHASE_LOCK = mp.Lock()
+
     total = len(seeds)
     chunk = total // NUM_WORKERS
     remainder = total % NUM_WORKERS
@@ -485,35 +531,66 @@ def run_derivation_phase(worker_fn, seeds, stop_event, coin):
         count = chunk + (1 if w < remainder else 0)
         if count == 0:
             continue
-        tasks.append((w, start, count, stop_event))
+        tasks.append((w, start, count))
         start += count
 
-    produced = []
-    t0 = time.time()
-    total_written = 0
+    print(f"{coin} derive: launching {len(tasks)} workers over {total:,} seeds", flush=True)
 
-    ctx = mp.get_context("fork")
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS, mp_context=ctx) as executor:
-        futures = [executor.submit(worker_fn, t) for t in tasks]
-        try:
-            for fut in as_completed(futures):
-                try:
-                    path, written = fut.result()
-                    produced.append(path)
-                    total_written += written
-                except Exception as e:
-                    print(f"{coin} worker error: {e}")
-        except KeyboardInterrupt:
-            stop_event.set()
-            for fut in futures:
-                try:
-                    fut.result(timeout=10)
-                except Exception:
-                    pass
+    produced = []
+    total_written = 0
+    t0 = time.time()
+
+    monitor_stop = threading.Event()
+
+    def monitor():
+        last_total = 0
+        last_time = time.time()
+        while not monitor_stop.wait(MONITOR_INTERVAL):
+            cur = _PHASE_COUNTER.value
+            now = time.time()
+            dt = now - last_time
+            inst_rate = (cur - last_total) / dt if dt > 0 else 0
+            avg_rate = cur / (now - t0) if now > t0 else 0
+            pct = 100.0 * cur / total if total else 0
+            print(
+                f"  {coin}: {cur:,}/{total:,} ({pct:.1f}%) "
+                f"rate={inst_rate:,.0f}/s avg={avg_rate:,.0f}/s",
+                flush=True,
+            )
+            last_total = cur
+            last_time = now
+
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    monitor_thread.start()
+
+    try:
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=NUM_WORKERS, mp_context=ctx) as executor:
+            futures = [executor.submit(worker_fn, t) for t in tasks]
+            try:
+                for fut in as_completed(futures):
+                    try:
+                        path, written = fut.result()
+                        produced.append(path)
+                        total_written += written
+                    except Exception as e:
+                        print(f"{coin} worker error: {e}", flush=True)
+            except KeyboardInterrupt:
+                stop_event.set()
+                for fut in futures:
+                    try:
+                        fut.result(timeout=10)
+                    except Exception:
+                        pass
+    finally:
+        monitor_stop.set()
 
     elapsed = time.time() - t0
     rate = total_written / elapsed if elapsed else 0
-    print(f"{coin} derived: {total_written:,} addresses in {elapsed:.0f}s ({rate:,.0f}/s)")
+    print(
+        f"{coin} derived: {total_written:,} addresses in {elapsed:.0f}s ({rate:,.0f}/s)",
+        flush=True,
+    )
 
     return produced
 
@@ -555,7 +632,7 @@ def lookup_addresses(temp_files, db_path, coin):
 
                     if total_lines - last_log >= LOOKUP_LOG_EVERY:
                         rate = total_lines / (time.time() - t0)
-                        print(f"  {coin}: {total_lines:,} ({rate:,.0f}/s, {matches} hits)")
+                        print(f"  {coin}: {total_lines:,} ({rate:,.0f}/s, {matches} hits)", flush=True)
                         last_log = total_lines
 
             cleanup_temp_file(path)
@@ -564,34 +641,37 @@ def lookup_addresses(temp_files, db_path, coin):
 
     elapsed = time.time() - t0
     rate = total_lines / elapsed if elapsed else 0
-    print(f"{coin} lookup: {total_lines:,} in {elapsed:.0f}s ({rate:,.0f}/s), {matches} hits")
+    print(
+        f"{coin} lookup: {total_lines:,} in {elapsed:.0f}s ({rate:,.0f}/s), {matches} hits",
+        flush=True,
+    )
     return matches
 
 
 # ----------------------------------------------------------------------
-# Blockchain phases
+# Phases
 # ----------------------------------------------------------------------
 def process_btc(seeds, stop_event):
-    print("=== BTC phase ===")
+    print("=== BTC phase ===", flush=True)
     files = run_derivation_phase(derive_worker_btc, seeds, stop_event, "BTC")
     matches = lookup_addresses(files, BTC_DB, "BTC")
-    print("=== BTC phase done ===")
+    print("=== BTC phase done ===", flush=True)
     return matches
 
 
 def process_eth(seeds, stop_event):
-    print("=== ETH phase ===")
+    print("=== ETH phase ===", flush=True)
     files = run_derivation_phase(derive_worker_eth, seeds, stop_event, "ETH")
     matches = lookup_addresses(files, ETH_DB, "ETH")
-    print("=== ETH phase done ===")
+    print("=== ETH phase done ===", flush=True)
     return matches
 
 
 def process_sol(seeds, stop_event):
-    print("=== SOL phase ===")
+    print("=== SOL phase ===", flush=True)
     files = run_derivation_phase(derive_worker_sol, seeds, stop_event, "SOL")
     matches = lookup_addresses(files, SOL_DB, "SOL")
-    print("=== SOL phase done ===")
+    print("=== SOL phase done ===", flush=True)
     return matches
 
 
@@ -601,7 +681,7 @@ def process_sol(seeds, stop_event):
 def ensure_valid_seeds():
     if os.path.exists(VALID_SEEDS_FILE) and os.path.getsize(VALID_SEEDS_FILE) > 0:
         return True
-    print(f"{VALID_SEEDS_FILE} missing, running generator")
+    print(f"{VALID_SEEDS_FILE} missing, running generator", flush=True)
     try:
         result = subprocess.run([sys.executable, GENERATOR_SCRIPT], check=False)
         if result.returncode != 0:
@@ -614,7 +694,7 @@ def ensure_valid_seeds():
 
 
 def call_generator_for_next_round():
-    print("calling generator")
+    print("calling generator", flush=True)
     try:
         result = subprocess.run([sys.executable, GENERATOR_SCRIPT], check=False)
         if result.returncode != 0:
@@ -673,13 +753,12 @@ def main():
         print("ERROR: no seeds")
         sys.exit(1)
 
-    print(f"loaded {len(SEEDS):,} seeds; {NUM_WORKERS} workers per phase")
+    print(f"loaded {len(SEEDS):,} seeds; {NUM_WORKERS} workers per phase", flush=True)
 
-    manager = mp.Manager()
-    stop_event = manager.Event()
+    stop_event = mp.Event()
 
     def _signal_handler(sig, frame):
-        print("interrupt")
+        print("interrupt", flush=True)
         stop_event.set()
 
     signal.signal(signal.SIGINT, _signal_handler)
