@@ -65,13 +65,10 @@ DERIVE_LOG_EVERY = 2_000_000
 
 SOL_DERIVATION_PATH = "m/44'/501'/0'/0'"
 
-# Module globals — set before any process pool is created.
-# Forked children inherit these via copy-on-write.
 SEEDS = []
 _STOP_EVENT = None
 _PHASE_COUNTER = None
 _PHASE_LOCK = None
-_DERIVE_LOG_COUNTER = None
 
 _telegram_bot_id = None
 _telegram_chat_id = None
@@ -392,7 +389,7 @@ def derive_sol_address(seed_bytes):
     """
     Solana ed25519 (SLIP-0010) at standard wallet path:
         m/44'/501'/0'/0'
-    All levels hardened.
+    All levels hardened. Uses Bip32Slip10Ed25519 (not Bip44Coins.SOLANA).
     """
     try:
         ctx = Bip32Slip10Ed25519.FromSeed(seed_bytes)
@@ -403,14 +400,14 @@ def derive_sol_address(seed_bytes):
 
 
 # ----------------------------------------------------------------------
-# Workers — read SEEDS / _STOP_EVENT / _PHASE_COUNTER via module globals
+# Workers (read SEEDS / _STOP_EVENT / _PHASE_COUNTER as module globals
+# inherited via fork — no Manager proxies in args)
 # ----------------------------------------------------------------------
 def _bump_progress(n):
     with _PHASE_LOCK:
         prev = _PHASE_COUNTER.value
         new = prev + n
         _PHASE_COUNTER.value = new
-        # Parent-visible derive log cadence
         prev_level = prev // DERIVE_LOG_EVERY
         new_level = new // DERIVE_LOG_EVERY
         log_now = new_level > prev_level
