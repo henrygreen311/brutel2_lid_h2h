@@ -17,7 +17,8 @@ OUTPUT_FILE = "valid_seeds.txt"
 PART_DIR = "seed_parts"
 LOG_VALID_INTERVAL = 2_000_000
 MAX_LOGS = 10
-FLUSH_EVERY = 200_000
+FLUSH_EVERY = 500_000
+STOP_CHECK_MASK = 0x3FFF
 MAX_PERMS = int(os.getenv("MAX_PERMS", "0"))
 
 ATOMIC_ID = 1
@@ -120,8 +121,9 @@ def worker(start_idx, count, worker_id, stop_event, base_indices, part_file,
 
     with open(part_file, "w", encoding="utf-8") as f:
         for offset in range(count):
-            if stop_event.is_set():
+            if (offset & STOP_CHECK_MASK) == 0 and stop_event.is_set():
                 break
+
             rank = start_idx + offset
             perm = permutation_indices(base_indices, rank)
 
