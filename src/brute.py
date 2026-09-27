@@ -10,7 +10,6 @@ import signal
 import sqlite3
 import subprocess
 import logging
-import threading
 import contextlib
 import urllib.request
 import urllib.parse
@@ -59,9 +58,8 @@ TELEGRAM_MESSAGE_LIMIT = 4000
 NUM_WORKERS = 50
 LOOKUP_LOG_EVERY = 5_000_000
 STOP_CHECK_MASK = 0xFFF
-PROGRESS_FLUSH_EVERY = 50_000
+PROGRESS_FLUSH_EVERY = 10_000
 MONITOR_INTERVAL = 30
-DERIVE_LOG_EVERY = 2_000_000
 
 SOL_DERIVATION_PATH = "m/44'/501'/0'/0'"
 
@@ -339,11 +337,6 @@ def log_match(coin, seed, address, extra=None):
 # Derivation
 # ----------------------------------------------------------------------
 def derive_btc_addresses(seed_bytes):
-    """
-    BIP44 m/44'/0'/0'/0/0  -> P2PKH  (1...)
-    BIP49 m/49'/0'/0'/0/0  -> P2SH   (3...)
-    BIP84 m/84'/0'/0'/0/0  -> bech32 (bc1...)
-    """
     results = []
 
     try:
@@ -374,9 +367,6 @@ def derive_btc_addresses(seed_bytes):
 
 
 def derive_eth_address(seed_bytes):
-    """
-    BIP44 m/44'/60'/0'/0/0 -> Ethereum address (0x...)
-    """
     try:
         return Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM) \
             .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
@@ -386,11 +376,6 @@ def derive_eth_address(seed_bytes):
 
 
 def derive_sol_address(seed_bytes):
-    """
-    Solana ed25519 (SLIP-0010) at standard wallet path:
-        m/44'/501'/0'/0'
-    All levels hardened. Uses Bip32Slip10Ed25519 (not Bip44Coins.SOLANA).
-    """
     try:
         ctx = Bip32Slip10Ed25519.FromSeed(seed_bytes)
         derived = ctx.DerivePath(SOL_DERIVATION_PATH)
@@ -400,18 +385,19 @@ def derive_sol_address(seed_bytes):
 
 
 # ----------------------------------------------------------------------
-# Workers (read SEEDS / _STOP_EVENT / _PHASE_COUNTER as module globals
-# inherited via fork — no Manager proxies in args)
+# Workers
 # ----------------------------------------------------------------------
-def _bump_progress(n):
+def _flush_progress():
+    global _PHASE_COUNTER
+    # Runs inside worker; _PHASE_LOCK is a manager proxy, safe across procs
     with _PHASE_LOCK:
-        prev = _PHASE_COUNTER.value
-        new = prev + n
-        _PHASE_COUNTER.value = new
-        prev_level = prev // DERIVE_LOG_EVERY
-        new_level = new // DERIVE_LOG_EVERY
-        log_now = new_level > prev_level
-    return log_now, new
+        _PHASE_COUNTER.value = _PHASE_COUNTER.value + PROGRESS_FLUSH_EVERY
+
+
+def _flush_progress_partial(n):
+    global _PHASE_COUNTER
+    with _PHASE_LOCK:
+        _PHASE_COUNTER.value = _PHASE_COUNTER.value + n
 
 
 def derive_worker_btc(args):
@@ -429,6 +415,9 @@ def derive_worker_btc(args):
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
                 since_flush += 1
+                if since_flush >= PROGRESS_FLUSH_EVERY:
+                    _flush_progress()
+                    since_flush = 0
                 continue
             for _typ, addr in derive_btc_addresses(seed_bytes):
                 f.write(f"{addr}\t{seed}\n")
@@ -436,11 +425,11 @@ def derive_worker_btc(args):
 
             since_flush += 1
             if since_flush >= PROGRESS_FLUSH_EVERY:
-                _bump_progress(since_flush)
+                _flush_progress()
                 since_flush = 0
 
         if since_flush:
-            _bump_progress(since_flush)
+            _flush_progress_partial(since_flush)
 
     return path, written
 
@@ -460,6 +449,9 @@ def derive_worker_eth(args):
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
                 since_flush += 1
+                if since_flush >= PROGRESS_FLUSH_EVERY:
+                    _flush_progress()
+                    since_flush = 0
                 continue
             addr = derive_eth_address(seed_bytes)
             if addr:
@@ -468,11 +460,11 @@ def derive_worker_eth(args):
 
             since_flush += 1
             if since_flush >= PROGRESS_FLUSH_EVERY:
-                _bump_progress(since_flush)
+                _flush_progress()
                 since_flush = 0
 
         if since_flush:
-            _bump_progress(since_flush)
+            _flush_progress_partial(since_flush)
 
     return path, written
 
@@ -492,6 +484,9 @@ def derive_worker_sol(args):
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
                 since_flush += 1
+                if since_flush >= PROGRESS_FLUSH_EVERY:
+                    _flush_progress()
+                    since_flush = 0
                 continue
             addr = derive_sol_address(seed_bytes)
             if addr:
@@ -500,23 +495,25 @@ def derive_worker_sol(args):
 
             since_flush += 1
             if since_flush >= PROGRESS_FLUSH_EVERY:
-                _bump_progress(since_flush)
+                _flush_progress()
                 since_flush = 0
 
         if since_flush:
-            _bump_progress(since_flush)
+            _flush_progress_partial(since_flush)
 
     return path, written
 
 
 # ----------------------------------------------------------------------
-# Phase runner
+# Phase runner — no threads; SIGALRM drives progress printing
 # ----------------------------------------------------------------------
 def run_derivation_phase(worker_fn, seeds, stop_event, coin):
     global _STOP_EVENT, _PHASE_COUNTER, _PHASE_LOCK
     _STOP_EVENT = stop_event
-    _PHASE_COUNTER = mp.Value("q", 0)
-    _PHASE_LOCK = mp.Lock()
+
+    manager = mp.Manager()
+    _PHASE_COUNTER = manager.Value("q", 0)
+    _PHASE_LOCK = manager.Lock()
 
     total = len(seeds)
     chunk = total // NUM_WORKERS
@@ -533,32 +530,26 @@ def run_derivation_phase(worker_fn, seeds, stop_event, coin):
 
     print(f"{coin} derive: launching {len(tasks)} workers over {total:,} seeds", flush=True)
 
+    t0 = time.time()
+    last_seen = [0]
+
+    def _alarm_handler(signum, frame):
+        try:
+            cur = _PHASE_COUNTER.value
+        except Exception:
+            return
+        now = time.time()
+        elapsed = now - t0 if now > t0 else 1
+        avg = cur / elapsed
+        pct = 100.0 * cur / total if total else 0
+        print(f"  {coin}: {cur:,}/{total:,} ({pct:.1f}%) avg={avg:,.0f}/s", flush=True)
+        last_seen[0] = cur
+
+    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.setitimer(signal.ITIMER_REAL, MONITOR_INTERVAL, MONITOR_INTERVAL)
+
     produced = []
     total_written = 0
-    t0 = time.time()
-
-    monitor_stop = threading.Event()
-
-    def monitor():
-        last_total = 0
-        last_time = time.time()
-        while not monitor_stop.wait(MONITOR_INTERVAL):
-            cur = _PHASE_COUNTER.value
-            now = time.time()
-            dt = now - last_time
-            inst_rate = (cur - last_total) / dt if dt > 0 else 0
-            avg_rate = cur / (now - t0) if now > t0 else 0
-            pct = 100.0 * cur / total if total else 0
-            print(
-                f"  {coin}: {cur:,}/{total:,} ({pct:.1f}%) "
-                f"rate={inst_rate:,.0f}/s avg={avg_rate:,.0f}/s",
-                flush=True,
-            )
-            last_total = cur
-            last_time = now
-
-    monitor_thread = threading.Thread(target=monitor, daemon=True)
-    monitor_thread.start()
 
     try:
         ctx = mp.get_context("fork")
@@ -580,7 +571,8 @@ def run_derivation_phase(worker_fn, seeds, stop_event, coin):
                     except Exception:
                         pass
     finally:
-        monitor_stop.set()
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
 
     elapsed = time.time() - t0
     rate = total_written / elapsed if elapsed else 0
