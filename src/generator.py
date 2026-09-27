@@ -66,11 +66,6 @@ def update_atomic(fields):
     supabase.table("atomic").update(fields).eq("id", ATOMIC_ID).execute()
 
 
-def get_progress_flag():
-    row = get_atomic_row()
-    return row.get("progress") if row else None
-
-
 def set_progress_flag(value):
     update_atomic({"progress": value})
     print(f"progress = {value}")
@@ -263,15 +258,32 @@ def run_permutations(seed_phrase):
     print(f"done: {elapsed:.0f}s, {rate:,.0f}/s, valid={merged_lines:,}, {size_mb:.0f} MB")
 
 
-def should_run():
-    flag = get_progress_flag()
+def decide_action(row):
+    """
+    Decide what to do based on atomic state.
+
+    Returns:
+        "skip"        — valid_seeds.txt already present, progress=False: do nothing
+        "new_seed"    — progress=True: generate a brand new seed phrase
+        "resume_seed" — progress=False and file missing: reuse atomic.seed_phrase
+        "first_run"   — no seed anywhere: generate a brand new seed phrase
+    """
+    flag = row.get("progress")
+    existing_seed = row.get("seed_phrase")
     file_exists = os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0
 
+    has_valid_existing_seed = (
+        isinstance(existing_seed, str)
+        and len(existing_seed.strip().split()) == 12
+    )
+
     if flag is True:
-        return True
-    if not file_exists:
-        return True
-    return False
+        return "new_seed"
+    if file_exists:
+        return "skip"
+    if has_valid_existing_seed:
+        return "resume_seed"
+    return "first_run"
 
 
 def main():
@@ -280,20 +292,36 @@ def main():
         print("ERROR: atomic row id=1 missing")
         sys.exit(1)
 
-    if not should_run():
+    action = decide_action(row)
+    print(f"action: {action}")
+
+    if action == "skip":
         print("nothing to do")
         sys.exit(0)
 
-    seed_phrase = MNEMO.generate(strength=128)
-    print(f"seed: {seed_phrase}")
+    if action == "new_seed":
+        seed_phrase = MNEMO.generate(strength=128)
+        print(f"seed: {seed_phrase}")
+        try:
+            store_seed_phrase(seed_phrase)
+        except Exception as e:
+            print(f"ERROR: store failed: {e}")
+            sys.exit(1)
+        set_progress_flag(False)
 
-    try:
-        store_seed_phrase(seed_phrase)
-    except Exception as e:
-        print(f"ERROR: store failed: {e}")
-        sys.exit(1)
+    elif action == "resume_seed":
+        seed_phrase = row["seed_phrase"].strip()
+        print(f"seed (resume): {seed_phrase}")
 
-    set_progress_flag(False)
+    else:
+        seed_phrase = MNEMO.generate(strength=128)
+        print(f"seed: {seed_phrase}")
+        try:
+            store_seed_phrase(seed_phrase)
+        except Exception as e:
+            print(f"ERROR: store failed: {e}")
+            sys.exit(1)
+        set_progress_flag(False)
 
     try:
         run_permutations(seed_phrase)
