@@ -55,18 +55,17 @@ GENERATOR_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen
 
 ATOMIC_ID = 1
 TELEGRAM_MESSAGE_LIMIT = 4000
-NUM_WORKERS = 50
-LOOKUP_LOG_EVERY = 5_000_000
+NUM_WORKERS = 20
 STOP_CHECK_MASK = 0xFFF
-PROGRESS_FLUSH_EVERY = 10_000
-MONITOR_INTERVAL = 30
+
+# SQLite page cache per worker connection. 20 workers × 100 MB = 2 GB.
+SQLITE_CACHE_KB = -100_000
 
 SOL_DERIVATION_PATH = "m/44'/501'/0'/0'"
 
 SEEDS = []
 _STOP_EVENT = None
-_PHASE_COUNTER = None
-_PHASE_LOCK = None
+_MATCH_LOCK = None
 
 _telegram_bot_id = None
 _telegram_chat_id = None
@@ -291,7 +290,7 @@ class AddressChecker:
     def __init__(self, db_path):
         self.conn = sqlite3.connect(db_path)
         self.conn.execute("PRAGMA query_only = ON")
-        self.conn.execute("PRAGMA cache_size=-1000000")
+        self.conn.execute(f"PRAGMA cache_size={SQLITE_CACHE_KB}")
         self._cur = self.conn.cursor()
 
     def contains(self, address):
@@ -307,30 +306,6 @@ class AddressChecker:
             self.conn.close()
         except Exception:
             pass
-
-
-# ----------------------------------------------------------------------
-# Matches
-# ----------------------------------------------------------------------
-def log_match(coin, seed, address, extra=None):
-    record = {
-        "coin": coin,
-        "seed": seed,
-        "address": address,
-        "timestamp": time.time(),
-    }
-    if extra:
-        record["extra"] = extra
-
-    try:
-        with open(FOUND_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
-    except Exception as e:
-        print(f"WARN: local found file: {e}")
-
-    append_found_record(record)
-    send_telegram_alert(coin, seed, address, extra=extra)
-    print(f"MATCH [{coin}] {address} <- {seed}")
 
 
 # ----------------------------------------------------------------------
@@ -385,28 +360,40 @@ def derive_sol_address(seed_bytes):
 
 
 # ----------------------------------------------------------------------
-# Workers
+# Match recording (worker-safe — lock is shared via fork inheritance)
 # ----------------------------------------------------------------------
-def _flush_progress():
-    global _PHASE_COUNTER
-    # Runs inside worker; _PHASE_LOCK is a manager proxy, safe across procs
-    with _PHASE_LOCK:
-        _PHASE_COUNTER.value = _PHASE_COUNTER.value + PROGRESS_FLUSH_EVERY
+def _record_match(coin, seed, address, extra=None):
+    record = {
+        "coin": coin,
+        "seed": seed,
+        "address": address,
+        "timestamp": time.time(),
+    }
+    if extra:
+        record["extra"] = extra
+
+    # Cross-process lock: matches are rare, so contention is negligible.
+    with _MATCH_LOCK:
+        try:
+            with open(FOUND_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except Exception as e:
+            print(f"WARN: local found file: {e}")
+
+        append_found_record(record)
+        send_telegram_alert(coin, seed, address, extra=extra)
+
+    print(f"MATCH [{coin}] {address} <- {seed}", flush=True)
 
 
-def _flush_progress_partial(n):
-    global _PHASE_COUNTER
-    with _PHASE_LOCK:
-        _PHASE_COUNTER.value = _PHASE_COUNTER.value + n
-
-
-def derive_worker_btc(args):
+# ----------------------------------------------------------------------
+# Workers — derive + lookup in the same loop, no temp files
+# ----------------------------------------------------------------------
+def worker_btc(args):
     worker_id, start_idx, count = args
-    path = f"temp_btc_w{worker_id:02d}.txt"
-    written = 0
-    since_flush = 0
-
-    with open(path, "w", encoding="utf-8") as f:
+    checker = AddressChecker(BTC_DB)
+    matches = 0
+    try:
         for offset in range(count):
             if (offset & STOP_CHECK_MASK) == 0 and _STOP_EVENT.is_set():
                 break
@@ -414,33 +401,21 @@ def derive_worker_btc(args):
             try:
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
-                since_flush += 1
-                if since_flush >= PROGRESS_FLUSH_EVERY:
-                    _flush_progress()
-                    since_flush = 0
                 continue
-            for _typ, addr in derive_btc_addresses(seed_bytes):
-                f.write(f"{addr}\t{seed}\n")
-                written += 1
-
-            since_flush += 1
-            if since_flush >= PROGRESS_FLUSH_EVERY:
-                _flush_progress()
-                since_flush = 0
-
-        if since_flush:
-            _flush_progress_partial(since_flush)
-
-    return path, written
+            for addr_type, addr in derive_btc_addresses(seed_bytes):
+                if checker.contains(addr):
+                    _record_match("BTC", seed, addr, addr_type)
+                    matches += 1
+        return matches
+    finally:
+        checker.close()
 
 
-def derive_worker_eth(args):
+def worker_eth(args):
     worker_id, start_idx, count = args
-    path = f"temp_eth_w{worker_id:02d}.txt"
-    written = 0
-    since_flush = 0
-
-    with open(path, "w", encoding="utf-8") as f:
+    checker = AddressChecker(ETH_DB)
+    matches = 0
+    try:
         for offset in range(count):
             if (offset & STOP_CHECK_MASK) == 0 and _STOP_EVENT.is_set():
                 break
@@ -448,34 +423,21 @@ def derive_worker_eth(args):
             try:
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
-                since_flush += 1
-                if since_flush >= PROGRESS_FLUSH_EVERY:
-                    _flush_progress()
-                    since_flush = 0
                 continue
             addr = derive_eth_address(seed_bytes)
-            if addr:
-                f.write(f"{addr}\t{seed}\n")
-                written += 1
-
-            since_flush += 1
-            if since_flush >= PROGRESS_FLUSH_EVERY:
-                _flush_progress()
-                since_flush = 0
-
-        if since_flush:
-            _flush_progress_partial(since_flush)
-
-    return path, written
+            if addr and checker.contains(addr):
+                _record_match("ETH", seed, addr)
+                matches += 1
+        return matches
+    finally:
+        checker.close()
 
 
-def derive_worker_sol(args):
+def worker_sol(args):
     worker_id, start_idx, count = args
-    path = f"temp_sol_w{worker_id:02d}.txt"
-    written = 0
-    since_flush = 0
-
-    with open(path, "w", encoding="utf-8") as f:
+    checker = AddressChecker(SOL_DB)
+    matches = 0
+    try:
         for offset in range(count):
             if (offset & STOP_CHECK_MASK) == 0 and _STOP_EVENT.is_set():
                 break
@@ -483,37 +445,24 @@ def derive_worker_sol(args):
             try:
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
-                since_flush += 1
-                if since_flush >= PROGRESS_FLUSH_EVERY:
-                    _flush_progress()
-                    since_flush = 0
                 continue
             addr = derive_sol_address(seed_bytes)
-            if addr:
-                f.write(f"{addr}\t{seed}\n")
-                written += 1
-
-            since_flush += 1
-            if since_flush >= PROGRESS_FLUSH_EVERY:
-                _flush_progress()
-                since_flush = 0
-
-        if since_flush:
-            _flush_progress_partial(since_flush)
-
-    return path, written
+            if addr and checker.contains(addr):
+                _record_match("SOL", seed, addr)
+                matches += 1
+        return matches
+    finally:
+        checker.close()
 
 
 # ----------------------------------------------------------------------
-# Phase runner — no threads; SIGALRM drives progress printing
+# Phase runner
 # ----------------------------------------------------------------------
-def run_derivation_phase(worker_fn, seeds, stop_event, coin):
-    global _STOP_EVENT, _PHASE_COUNTER, _PHASE_LOCK
+def run_phase(worker_fn, seeds, stop_event, coin):
+    global _STOP_EVENT, _MATCH_LOCK
     _STOP_EVENT = stop_event
-
-    manager = mp.Manager()
-    _PHASE_COUNTER = manager.Value("q", 0)
-    _PHASE_LOCK = manager.Lock()
+    if _MATCH_LOCK is None:
+        _MATCH_LOCK = mp.Lock()
 
     total = len(seeds)
     chunk = total // NUM_WORKERS
@@ -528,139 +477,56 @@ def run_derivation_phase(worker_fn, seeds, stop_event, coin):
         tasks.append((w, start, count))
         start += count
 
-    print(f"{coin} derive: launching {len(tasks)} workers over {total:,} seeds", flush=True)
+    print(f"{coin}: {len(tasks)} workers over {total:,} seeds", flush=True)
 
     t0 = time.time()
-    last_seen = [0]
+    total_matches = 0
 
-    def _alarm_handler(signum, frame):
+    ctx = mp.get_context("fork")
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS, mp_context=ctx) as executor:
+        futures = [executor.submit(worker_fn, t) for t in tasks]
         try:
-            cur = _PHASE_COUNTER.value
-        except Exception:
-            return
-        now = time.time()
-        elapsed = now - t0 if now > t0 else 1
-        avg = cur / elapsed
-        pct = 100.0 * cur / total if total else 0
-        print(f"  {coin}: {cur:,}/{total:,} ({pct:.1f}%) avg={avg:,.0f}/s", flush=True)
-        last_seen[0] = cur
+            for fut in as_completed(futures):
+                try:
+                    total_matches += fut.result()
+                except Exception as e:
+                    print(f"{coin} worker error: {e}", flush=True)
+        except KeyboardInterrupt:
+            stop_event.set()
+            for fut in futures:
+                try:
+                    fut.result(timeout=10)
+                except Exception:
+                    pass
 
-    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.setitimer(signal.ITIMER_REAL, MONITOR_INTERVAL, MONITOR_INTERVAL)
+    wall = time.time() - t0
+    rate = total / wall if wall else 0
+    print(f"{coin}: {total:,} seeds in {wall:.0f}s ({rate:,.0f}/s), {total_matches} hits", flush=True)
 
-    produced = []
-    total_written = 0
-
-    try:
-        ctx = mp.get_context("fork")
-        with ProcessPoolExecutor(max_workers=NUM_WORKERS, mp_context=ctx) as executor:
-            futures = [executor.submit(worker_fn, t) for t in tasks]
-            try:
-                for fut in as_completed(futures):
-                    try:
-                        path, written = fut.result()
-                        produced.append(path)
-                        total_written += written
-                    except Exception as e:
-                        print(f"{coin} worker error: {e}", flush=True)
-            except KeyboardInterrupt:
-                stop_event.set()
-                for fut in futures:
-                    try:
-                        fut.result(timeout=10)
-                    except Exception:
-                        pass
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, old_handler)
-
-    elapsed = time.time() - t0
-    rate = total_written / elapsed if elapsed else 0
-    print(
-        f"{coin} derived: {total_written:,} addresses in {elapsed:.0f}s ({rate:,.0f}/s)",
-        flush=True,
-    )
-
-    return produced
-
-
-def cleanup_temp_file(path):
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except OSError as e:
-        print(f"WARN: delete {path}: {e}")
-
-
-def lookup_addresses(temp_files, db_path, coin):
-    if not temp_files:
-        print(f"{coin} lookup: no temp files")
-        return 0
-
-    checker = AddressChecker(db_path)
-    total_lines = 0
-    matches = 0
-    last_log = 0
-    t0 = time.time()
-
-    try:
-        for path in temp_files:
-            if not os.path.exists(path):
-                continue
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.rstrip("\n")
-                    if not line:
-                        continue
-                    addr, _, seed = line.partition("\t")
-                    total_lines += 1
-
-                    if checker.contains(addr):
-                        log_match(coin, seed, addr)
-                        matches += 1
-
-                    if total_lines - last_log >= LOOKUP_LOG_EVERY:
-                        rate = total_lines / (time.time() - t0)
-                        print(f"  {coin}: {total_lines:,} ({rate:,.0f}/s, {matches} hits)", flush=True)
-                        last_log = total_lines
-
-            cleanup_temp_file(path)
-    finally:
-        checker.close()
-
-    elapsed = time.time() - t0
-    rate = total_lines / elapsed if elapsed else 0
-    print(
-        f"{coin} lookup: {total_lines:,} in {elapsed:.0f}s ({rate:,.0f}/s), {matches} hits",
-        flush=True,
-    )
-    return matches
+    return total_matches
 
 
 # ----------------------------------------------------------------------
-# Phases
+# Phases — strictly sequential: BTC → ETH → SOL
 # ----------------------------------------------------------------------
 def process_btc(seeds, stop_event):
     print("=== BTC phase ===", flush=True)
-    files = run_derivation_phase(derive_worker_btc, seeds, stop_event, "BTC")
-    matches = lookup_addresses(files, BTC_DB, "BTC")
-    print("=== BTC phase done ===", flush=True)
+    matches = run_phase(worker_btc, seeds, stop_event, "BTC")
+    print("=== BTC done ===", flush=True)
     return matches
 
 
 def process_eth(seeds, stop_event):
     print("=== ETH phase ===", flush=True)
-    files = run_derivation_phase(derive_worker_eth, seeds, stop_event, "ETH")
-    matches = lookup_addresses(files, ETH_DB, "ETH")
-    print("=== ETH phase done ===", flush=True)
+    matches = run_phase(worker_eth, seeds, stop_event, "ETH")
+    print("=== ETH done ===", flush=True)
     return matches
 
 
 def process_sol(seeds, stop_event):
     print("=== SOL phase ===", flush=True)
-    files = run_derivation_phase(derive_worker_sol, seeds, stop_event, "SOL")
-    matches = lookup_addresses(files, SOL_DB, "SOL")
-    print("=== SOL phase done ===", flush=True)
+    matches = run_phase(worker_sol, seeds, stop_event, "SOL")
+    print("=== SOL done ===", flush=True)
     return matches
 
 
@@ -711,7 +577,7 @@ def finalize_round():
 # Main
 # ----------------------------------------------------------------------
 def main():
-    global SEEDS
+    global SEEDS, _MATCH_LOCK
 
     row = get_atomic_row()
     if row is None:
@@ -742,9 +608,10 @@ def main():
         print("ERROR: no seeds")
         sys.exit(1)
 
-    print(f"loaded {len(SEEDS):,} seeds; {NUM_WORKERS} workers per phase", flush=True)
+    print(f"loaded {len(SEEDS):,} seeds; workers={NUM_WORKERS} cpu_count={os.cpu_count()}", flush=True)
 
     stop_event = mp.Event()
+    _MATCH_LOCK = mp.Lock()
 
     def _signal_handler(sig, frame):
         print("interrupt", flush=True)
