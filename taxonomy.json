@@ -1,0 +1,637 @@
+{
+  "version": "2.0",
+  "usage_restriction": "Detection rules for a repo-level secret scanner. Each rule combines a regex (with a capture group identifying the secret) with an optional Shannon-entropy threshold and a keyword pre-filter. Rules are checked against file contents; a keyword hit is only a hint that a rule *might* apply — the regex and entropy gate then decide whether a finding is real. Inspired by gitleaks/trufflehog rule shapes.",
+  "settings": {
+    "min_entropy": 3.0,
+    "max_file_size_kb": 2048,
+    "skip_extensions": [
+      ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg",
+      ".pdf", ".zip", ".gz", ".tgz", ".tar", ".rar", ".7z", ".bz2", ".xz",
+      ".mp3", ".mp4", ".wav", ".ogg", ".mov", ".avi", ".mkv",
+      ".woff", ".woff2", ".ttf", ".eot", ".otf",
+      ".exe", ".dll", ".so", ".dylib", ".bin", ".class", ".jar", ".war",
+      ".pyc", ".pyo", ".o", ".a", ".obj", ".wasm",
+      ".lock", ".sum", ".map"
+    ],
+    "skip_paths": [
+      "/.git/", "/node_modules/", "/vendor/", "/dist/", "/build/",
+      "/.venv/", "/venv/", "/__pycache__/", "/.mypy_cache/",
+      "/target/", "/bin/", "/obj/", "/coverage/", "/.next/", "/.nuxt/"
+    ]
+  },
+  "rules": [
+    {
+      "id": "aws-access-key-id",
+      "description": "AWS Access Key ID",
+      "category": "cloud_provider_credentials",
+      "risk": "critical",
+      "regex": "\\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["AKIA", "ASIA", "A3T", "ABIA", "ACCA"],
+      "allowlist": { "regexes": ["AKIAIOSFODNN7EXAMPLE", "AKIAI44QH8DHBEXAMPLE"] }
+    },
+    {
+      "id": "aws-secret-access-key",
+      "description": "AWS Secret Access Key",
+      "category": "cloud_provider_credentials",
+      "risk": "critical",
+      "regex": "(?i)aws[_\\- ]?(?:secret|access)[_\\- ]?(?:access[_\\- ]?)?key[\"'\\s:=]{1,20}([A-Za-z0-9/+=]{40})",
+      "secret_group": 1,
+      "entropy": 4.0,
+      "keywords": ["aws_secret", "aws-secret", "secret_access_key", "secretaccesskey"]
+    },
+    {
+      "id": "aws-session-token",
+      "description": "AWS Session Token",
+      "category": "cloud_provider_credentials",
+      "risk": "high",
+      "regex": "(?i)aws_session_token[\"'\\s:=]{1,10}([A-Za-z0-9/+=]{100,})",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["aws_session_token"]
+    },
+    {
+      "id": "gcp-api-key",
+      "description": "Google Cloud API Key",
+      "category": "cloud_provider_credentials",
+      "risk": "high",
+      "regex": "\\b(AIza[0-9A-Za-z\\-_]{35})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["AIza"]
+    },
+    {
+      "id": "gcp-service-account",
+      "description": "GCP Service Account JSON (private_key_id + private_key block)",
+      "category": "cloud_provider_credentials",
+      "risk": "critical",
+      "regex": "\"type\"\\s*:\\s*\"service_account\"[\\s\\S]{1,4000}?\"private_key\"\\s*:\\s*\"(-----BEGIN PRIVATE KEY-----[^\"]{100,})\"",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["service_account", "private_key"]
+    },
+    {
+      "id": "azure-storage-account-key",
+      "description": "Azure Storage Account Key",
+      "category": "cloud_provider_credentials",
+      "risk": "critical",
+      "regex": "(?i)AccountKey\\s*=\\s*([A-Za-z0-9+/=]{86,90})",
+      "secret_group": 1,
+      "entropy": 4.0,
+      "keywords": ["AccountKey"]
+    },
+    {
+      "id": "azure-connection-string",
+      "description": "Azure Service Bus / Storage connection string with SharedAccessKey",
+      "category": "cloud_provider_credentials",
+      "risk": "critical",
+      "regex": "(?i)SharedAccessKey=([A-Za-z0-9+/=]{40,90})",
+      "secret_group": 1,
+      "entropy": 4.0,
+      "keywords": ["SharedAccessKey"]
+    },
+
+    {
+      "id": "openai-api-key",
+      "description": "OpenAI API key",
+      "category": "ai_and_ml_api_keys",
+      "risk": "high",
+      "regex": "\\b(sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\\-]{20,200})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["sk-"],
+      "allowlist": { "regexes": ["sk-xxxxxxxx", "sk-your", "sk-REPLACE"] }
+    },
+    {
+      "id": "anthropic-api-key",
+      "description": "Anthropic API key",
+      "category": "ai_and_ml_api_keys",
+      "risk": "high",
+      "regex": "\\b(sk-ant-(?:api[0-9]{2}-)?[A-Za-z0-9_\\-]{80,200})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["sk-ant-"]
+    },
+    {
+      "id": "huggingface-token",
+      "description": "Hugging Face user access token",
+      "category": "ai_and_ml_api_keys",
+      "risk": "high",
+      "regex": "\\b(hf_[A-Za-z0-9]{34,40})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["hf_"]
+    },
+    {
+      "id": "replicate-token",
+      "description": "Replicate API token",
+      "category": "ai_and_ml_api_keys",
+      "risk": "high",
+      "regex": "\\b(r8_[A-Za-z0-9]{36,40})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["r8_"]
+    },
+    {
+      "id": "cohere-api-key",
+      "description": "Cohere API key",
+      "category": "ai_and_ml_api_keys",
+      "risk": "high",
+      "regex": "(?i)cohere[_\\- ]?api[_\\- ]?key[\"'\\s:=]{1,20}([A-Za-z0-9]{40})",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["cohere"]
+    },
+
+    {
+      "id": "stripe-secret-key",
+      "description": "Stripe live secret key",
+      "category": "payment_provider_keys",
+      "risk": "critical",
+      "regex": "\\b(sk_live_[0-9a-zA-Z]{24,99})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["sk_live_"]
+    },
+    {
+      "id": "stripe-restricted-key",
+      "description": "Stripe live restricted key",
+      "category": "payment_provider_keys",
+      "risk": "critical",
+      "regex": "\\b(rk_live_[0-9a-zA-Z]{24,99})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["rk_live_"]
+    },
+    {
+      "id": "square-access-token",
+      "description": "Square access token",
+      "category": "payment_provider_keys",
+      "risk": "critical",
+      "regex": "\\b(sq0atp-[0-9A-Za-z\\-_]{22}|EAAA[a-zA-Z0-9\\-_]{60,})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["sq0atp-", "EAAA"]
+    },
+    {
+      "id": "braintree-access-token",
+      "description": "Braintree production access token",
+      "category": "payment_provider_keys",
+      "risk": "critical",
+      "regex": "access_token\\$production\\$[0-9a-z]{16}\\$[0-9a-f]{32}",
+      "secret_group": 0,
+      "entropy": 0,
+      "keywords": ["access_token$production$"]
+    },
+    {
+      "id": "razorpay-key-secret",
+      "description": "Razorpay key secret",
+      "category": "payment_provider_keys",
+      "risk": "critical",
+      "regex": "(?i)razorpay[_\\- ]?(?:key[_\\- ]?)?secret[\"'\\s:=]{1,20}([A-Za-z0-9]{24,40})",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["razorpay"]
+    },
+
+    {
+      "id": "sendgrid-api-key",
+      "description": "SendGrid API key",
+      "category": "email_and_smtp",
+      "risk": "high",
+      "regex": "\\b(SG\\.[A-Za-z0-9_\\-]{22}\\.[A-Za-z0-9_\\-]{43})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["SG."]
+    },
+    {
+      "id": "mailgun-api-key",
+      "description": "Mailgun API key",
+      "category": "email_and_smtp",
+      "risk": "high",
+      "regex": "\\b(key-[0-9a-zA-Z]{32})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["key-"]
+    },
+    {
+      "id": "postmark-server-token",
+      "description": "Postmark server token",
+      "category": "email_and_smtp",
+      "risk": "high",
+      "regex": "(?i)postmark[_\\- ]?(?:server[_\\- ]?)?token[\"'\\s:=]{1,20}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["postmark"]
+    },
+    {
+      "id": "mailchimp-api-key",
+      "description": "Mailchimp API key",
+      "category": "email_and_smtp",
+      "risk": "high",
+      "regex": "\\b([0-9a-f]{32}-us[0-9]{1,2})\\b",
+      "secret_group": 1,
+      "entropy": 3.0,
+      "keywords": ["-us"]
+    },
+
+    {
+      "id": "slack-token",
+      "description": "Slack API token",
+      "category": "messaging_platforms",
+      "risk": "high",
+      "regex": "\\b(xox[baprs]-[0-9a-zA-Z-]{10,72})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"]
+    },
+    {
+      "id": "slack-webhook",
+      "description": "Slack incoming webhook URL",
+      "category": "webhooks",
+      "risk": "high",
+      "regex": "(https://hooks\\.slack\\.com/services/T[a-zA-Z0-9_]{8,}/B[a-zA-Z0-9_]{8,}/[a-zA-Z0-9_]{20,})",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["hooks.slack.com"]
+    },
+    {
+      "id": "discord-bot-token",
+      "description": "Discord bot token",
+      "category": "messaging_platforms",
+      "risk": "high",
+      "regex": "\\b([MN][A-Za-z\\d]{23}\\.[\\w-]{6}\\.[\\w-]{27,38})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": [""]
+    },
+    {
+      "id": "discord-webhook",
+      "description": "Discord webhook URL",
+      "category": "webhooks",
+      "risk": "high",
+      "regex": "(https://(?:discord|discordapp)\\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_\\-]{60,})",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["discord.com/api/webhooks", "discordapp.com/api/webhooks"]
+    },
+    {
+      "id": "teams-webhook",
+      "description": "Microsoft Teams incoming webhook URL",
+      "category": "webhooks",
+      "risk": "high",
+      "regex": "(https://[a-zA-Z0-9-]+\\.webhook\\.office\\.com/webhookb2/[a-z0-9-]+@[a-z0-9-]+/IncomingWebhook/[a-z0-9]+/[a-z0-9-]+)",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["webhook.office.com", "webhookb2"]
+    },
+    {
+      "id": "telegram-bot-token",
+      "description": "Telegram bot token",
+      "category": "messaging_platforms",
+      "risk": "high",
+      "regex": "\\b([0-9]{8,10}:[A-Za-z0-9_\\-]{35})\\b",
+      "secret_group": 1,
+      "entropy": 3.0,
+      "keywords": ["bot"]
+    },
+
+    {
+      "id": "github-pat-classic",
+      "description": "GitHub personal access token (classic)",
+      "category": "version_control_tokens",
+      "risk": "critical",
+      "regex": "\\b(ghp_[0-9a-zA-Z]{36})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["ghp_"]
+    },
+    {
+      "id": "github-oauth-token",
+      "description": "GitHub OAuth token",
+      "category": "version_control_tokens",
+      "risk": "critical",
+      "regex": "\\b(gho_[0-9a-zA-Z]{36})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["gho_"]
+    },
+    {
+      "id": "github-app-token",
+      "description": "GitHub App token (user or server)",
+      "category": "version_control_tokens",
+      "risk": "critical",
+      "regex": "\\b(gh[uas]_[0-9a-zA-Z]{36})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["ghu_", "gha_", "ghs_"]
+    },
+    {
+      "id": "github-refresh-token",
+      "description": "GitHub refresh token",
+      "category": "version_control_tokens",
+      "risk": "high",
+      "regex": "\\b(ghr_[0-9a-zA-Z]{76})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["ghr_"]
+    },
+    {
+      "id": "github-fine-grained-pat",
+      "description": "GitHub fine-grained personal access token",
+      "category": "version_control_tokens",
+      "risk": "critical",
+      "regex": "\\b(github_pat_[0-9a-zA-Z_]{82})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["github_pat_"]
+    },
+    {
+      "id": "gitlab-pat",
+      "description": "GitLab personal access token",
+      "category": "version_control_tokens",
+      "risk": "critical",
+      "regex": "\\b(glpat-[0-9a-zA-Z\\-_]{20})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["glpat-"]
+    },
+    {
+      "id": "npm-token",
+      "description": "npm access token",
+      "category": "package_registry_tokens",
+      "risk": "high",
+      "regex": "\\b(npm_[a-zA-Z0-9]{36})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["npm_"]
+    },
+    {
+      "id": "pypi-token",
+      "description": "PyPI API token",
+      "category": "package_registry_tokens",
+      "risk": "high",
+      "regex": "\\b(pypi-AgEIcHlwaS5vcmc[A-Za-z0-9\\-_]{50,})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["pypi-AgEI"]
+    },
+    {
+      "id": "dockerhub-pat",
+      "description": "Docker Hub personal access token",
+      "category": "package_registry_tokens",
+      "risk": "high",
+      "regex": "\\b(dckr_pat_[a-zA-Z0-9\\-_]{27})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["dckr_pat_"]
+    },
+    {
+      "id": "rubygems-key",
+      "description": "RubyGems API key",
+      "category": "package_registry_tokens",
+      "risk": "high",
+      "regex": "\\b(rubygems_[a-f0-9]{48})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["rubygems_"]
+    },
+
+    {
+      "id": "supabase-personal-access-token",
+      "description": "Supabase personal access token",
+      "category": "backend_platform_credentials",
+      "risk": "critical",
+      "regex": "\\b(sbp_[a-f0-9]{40})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["sbp_"]
+    },
+    {
+      "id": "supabase-service-role-jwt",
+      "description": "Supabase service_role JWT",
+      "category": "backend_platform_credentials",
+      "risk": "critical",
+      "regex": "\\b(eyJ[A-Za-z0-9_\\-]{20,}\\.eyJ[A-Za-z0-9_\\-]{20,}\\.[A-Za-z0-9_\\-]{20,})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["service_role", "supabase"]
+    },
+{
+  "id": "supabase-key-assignment",
+  "description": "Supabase key assignment in .env / db.txt style",
+  "category": "backend_platform_credentials",
+  "risk": "critical",
+  "regex": "(?i)SUPABASE_(?:SERVICE[_\\-]?ROLE[_\\-]?)?KEY\\s*[=:]\\s*[\"']?(eyJ[A-Za-z0-9_\\-]{20,}\\.[A-Za-z0-9_\\-]{20,}\\.[A-Za-z0-9_\\-]{20,})",
+  "secret_group": 1,
+  "entropy": 0,
+  "keywords": ["supabase_key", "supabase_service_role_key", "supabase-service-role-key"]
+},
+    {
+      "id": "firebase-cloud-messaging-key",
+      "description": "Firebase Cloud Messaging server key",
+      "category": "backend_platform_credentials",
+      "risk": "critical",
+      "regex": "\\b(AAAA[A-Za-z0-9_\\-]{7}:APA91b[A-Za-z0-9_\\-]{100,})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["AAAA", "APA91b"]
+    },
+    {
+      "id": "appwrite-api-key",
+      "description": "Appwrite server API key",
+      "category": "backend_platform_credentials",
+      "risk": "critical",
+      "regex": "\\b(standard_[a-f0-9]{64})\\b",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["standard_"]
+    },
+    {
+      "id": "pocketbase-admin",
+      "description": "PocketBase admin credentials",
+      "category": "backend_platform_credentials",
+      "risk": "high",
+      "regex": "(?i)pocketbase[\\s\\S]{0,200}?admin[\\s\\S]{0,200}?password[\"'\\s:=]{1,20}([^\"'\\s]{8,})",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["pocketbase"]
+    },
+
+    {
+      "id": "private-key-pem",
+      "description": "PEM private key block",
+      "category": "private_keys",
+      "risk": "critical",
+      "regex": "(-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP|ENCRYPTED|PRIVATE) ?(?:PRIVATE KEY|KEY) BLOCK?-----[\\s\\S]{40,}?-----END [A-Z ]+-----)",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["-----BEGIN"]
+    },
+    {
+      "id": "openssh-private-key",
+      "description": "OpenSSH private key",
+      "category": "private_keys",
+      "risk": "critical",
+      "regex": "(-----BEGIN OPENSSH PRIVATE KEY-----[\\s\\S]{100,}?-----END OPENSSH PRIVATE KEY-----)",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["BEGIN OPENSSH PRIVATE KEY"]
+    },
+
+    {
+      "id": "jwt-generic",
+      "description": "JSON Web Token",
+      "category": "oauth_tokens",
+      "risk": "medium",
+      "regex": "\\b(eyJ[A-Za-z0-9_\\-]{10,}\\.eyJ[A-Za-z0-9_\\-]{10,}\\.[A-Za-z0-9_\\-]{10,})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["eyJ"]
+    },
+
+    {
+      "id": "mongodb-connection-string",
+      "description": "MongoDB connection string with credentials",
+      "category": "database_credentials",
+      "risk": "critical",
+      "regex": "(mongodb(?:\\+srv)?://[^\\s:@\"']{1,64}:[^\\s:@\"']{1,64}@[^\\s\"']+)",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["mongodb://", "mongodb+srv://"]
+    },
+    {
+      "id": "postgres-connection-string",
+      "description": "PostgreSQL connection string with password",
+      "category": "database_credentials",
+      "risk": "critical",
+      "regex": "(postgres(?:ql)?://[^\\s:@\"']{1,64}:[^\\s:@\"']{1,64}@[^\\s\"']+)",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["postgres://", "postgresql://"]
+    },
+    {
+      "id": "mysql-connection-string",
+      "description": "MySQL connection string with password",
+      "category": "database_credentials",
+      "risk": "critical",
+      "regex": "(mysql://[^\\s:@\"']{1,64}:[^\\s:@\"']{1,64}@[^\\s\"']+)",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["mysql://"]
+    },
+    {
+      "id": "redis-connection-string",
+      "description": "Redis connection string with password",
+      "category": "database_credentials",
+      "risk": "critical",
+      "regex": "(rediss?://[^\\s:@\"']{0,64}:[^\\s:@\"']{1,64}@[^\\s\"']+)",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["redis://", "rediss://"]
+    },
+    {
+      "id": "jdbc-credentials",
+      "description": "JDBC URL with embedded credentials",
+      "category": "database_credentials",
+      "risk": "critical",
+      "regex": "(jdbc:[a-z0-9]+://[^\\s;\"']+[;?]user=[^&;\"']+[;&]password=[^&;\"']+)",
+      "secret_group": 1,
+      "entropy": 0,
+      "keywords": ["jdbc:"]
+    },
+
+    {
+      "id": "ethereum-private-key",
+      "description": "Ethereum / EVM private key",
+      "category": "crypto_wallet_secrets",
+      "risk": "critical",
+      "regex": "(?i)(?:private[_-]?key|priv[_-]?key|wallet[_-]?key)[\"'\\s:=]{1,20}(?:0x)?([a-fA-F0-9]{64})",
+      "secret_group": 1,
+      "entropy": 4.0,
+      "keywords": ["private_key", "privatekey", "priv_key", "wallet_key"]
+    },
+    {
+  "id": "bip39-mnemonic",
+  "description": "BIP39 keyword trigger (activates repo-wide wordlist scan)",
+  "category": "crypto_wallet_secrets",
+  "risk": "critical",
+  "regex": "(?i)\\b(?:mnemonic|seed[ _-]?phrase|recovery[ _-]?phrase)\\b",
+  "secret_group": 0,
+  "entropy": 0,
+  "keywords": [
+    "mnemonic", "seed_phrase", "seed phrase",
+    "recovery_phrase", "recovery phrase"
+  ]
+},
+
+    {
+      "id": "twitter-bearer-token",
+      "description": "Twitter/X Bearer token",
+      "category": "social_media_keys",
+      "risk": "high",
+      "regex": "\\b(AAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%]{20,})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["AAAAAAAAAAAAAAAAAAAAA"]
+    },
+    {
+      "id": "facebook-access-token",
+      "description": "Facebook access token",
+      "category": "social_media_keys",
+      "risk": "high",
+      "regex": "\\b(EAACEdEose0cBA[0-9A-Za-z]+)\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["EAACEdEose0cBA"]
+    },
+    {
+      "id": "twilio-api-key",
+      "description": "Twilio API key (SK + 32 hex)",
+      "category": "messaging_platforms",
+      "risk": "high",
+      "regex": "\\b(SK[0-9a-fA-F]{32})\\b",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["SK"]
+    },
+
+    {
+      "id": "generic-api-key",
+      "description": "Generic API key / secret / token assignment",
+      "category": "other_config_secrets",
+      "risk": "medium",
+      "regex": "(?i)(?:api[_-]?key|apikey|secret[_-]?key|client[_-]?secret|access[_-]?token|auth[_-]?token|private[_-]?token)[\"'\\s:=]{1,20}([A-Za-z0-9_\\-/+=]{24,})",
+      "secret_group": 1,
+      "entropy": 4.0,
+      "keywords": [
+        "api_key", "apikey", "api-key", "secret_key", "secret-key",
+        "client_secret", "client-secret", "access_token", "access-token",
+        "auth_token", "auth-token", "private_token", "private-token"
+      ],
+      "allowlist": {
+        "regexes": [
+          "example", "placeholder", "your[_-]?key", "changeme",
+          "xxxxxxxx", "12345678", "abcdefgh", "REPLACE[_-]?ME"
+        ]
+      }
+    },
+    {
+      "id": "generic-password",
+      "description": "Generic password assignment",
+      "category": "other_config_secrets",
+      "risk": "medium",
+      "regex": "(?i)(?:password|passwd|pwd)[\"'\\s:=]{1,10}([^\"'\\s,;]{10,64})",
+      "secret_group": 1,
+      "entropy": 3.5,
+      "keywords": ["password", "passwd", "pwd"],
+      "allowlist": {
+        "regexes": [
+          "password", "changeme", "your[_-]?password", "\\$\\{",
+          "process\\.env", "os\\.environ", "getenv", "example"
+        ]
+      }
+    }
+  ]
+}
