@@ -14,7 +14,7 @@ import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -38,8 +38,8 @@ MAX_STARS = 4
 # Language filter. Set to None to scan any language.
 LANGUAGE = None              # e.g. "python", "javascript", "go", "rust"
 
-# Only scan repos pushed after this date. Set to None to disable.
-PUSHED_AFTER = "2024-06-01"  # e.g. "2024-01-01"
+# Only scan repos pushed within the last N days (from now).
+PUSHED_WITHIN_DAYS = 7
 
 # Extra GitHub search qualifiers. Set to None to disable.
 EXTRA_QUERY = None           # e.g. "topic:iot"
@@ -178,6 +178,17 @@ def is_probably_binary(data: bytes) -> bool:
         return non_text / len(sample) > 0.30
 
 
+def is_mostly_non_ascii(data: bytes, threshold: float = 0.60) -> bool:
+    """True if the file is dominated by non-ASCII bytes. Catches CJK spam
+    payloads (SEO garbage) while keeping normal source code — even with
+    non-English comments — in scope."""
+    sample = data[:16384]
+    if not sample:
+        return False
+    non_ascii = sum(1 for b in sample if b > 127)
+    return non_ascii / len(sample) > threshold
+
+
 def mask_secret(secret: str) -> str:
     if len(secret) <= 8:
         return "*" * len(secret)
@@ -287,8 +298,9 @@ def build_query() -> str:
         parts.append(f"stars:{MIN_STARS}..{MAX_STARS}")
     if LANGUAGE:
         parts.append(f"language:{LANGUAGE}")
-    if PUSHED_AFTER:
-        parts.append(f"pushed:>{PUSHED_AFTER}")
+    if PUSHED_WITHIN_DAYS is not None and PUSHED_WITHIN_DAYS > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=PUSHED_WITHIN_DAYS))
+        parts.append(f"pushed:>={cutoff.strftime('%Y-%m-%d')}")
     parts.append("is:public")
     parts.append("archived:false")
     parts.append("fork:false")
@@ -420,6 +432,8 @@ def read_text_file(path: Path) -> str | None:
     except OSError:
         return None
     if is_probably_binary(raw):
+        return None
+    if is_mostly_non_ascii(raw):
         return None
     try:
         return raw.decode("utf-8")
@@ -598,7 +612,7 @@ def build_session(token: str) -> requests.Session:
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/3.3",
+        "User-Agent": "repo-secret-scanner/3.4",
     })
     return s
 
@@ -623,7 +637,8 @@ def main() -> int:
 
     query = build_query()
     log(f"query: {query}")
-    log(f"want: {COUNT} new repo(s)")
+    log(f"want: {COUNT} new repo(s), pushed within last "
+        f"{PUSHED_WITHIN_DAYS} day(s)")
 
     session = build_session(tokens[0])
     candidates = search_repositories(session, query, COUNT, scanned)

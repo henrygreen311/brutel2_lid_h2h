@@ -618,20 +618,27 @@
       }
     },
     {
-      "id": "generic-password",
-      "description": "Generic password assignment",
-      "category": "other_config_secrets",
-      "risk": "medium",
-      "regex": "(?i)(?:password|passwd|pwd)[\"'\\s:=]{1,10}([^\"'\\s,;]{10,64})",
-      "secret_group": 1,
-      "entropy": 3.5,
-      "keywords": ["password", "passwd", "pwd"],
-      "allowlist": {
-        "regexes": [
-          "password", "changeme", "your[_-]?password", "\\$\\{",
-          "process\\.env", "os\\.environ", "getenv", "example"
-        ]
-      }
-    }
+  "id": "generic-password",
+  "description": "Generic password assignment",
+  "category": "other_config_secrets",
+  "risk": "medium",
+  "regex": "(?i)\\b(?:password|passwd|passwd_hash|db_pass(?:word)?|user_pass(?:word)?|app_pass(?:word)?|admin_pass(?:word)?|root_pass(?:word)?|smtp_pass(?:word)?)\\b\\s*[:=]\\s*[\"']?([A-Za-z0-9_\\-!@#$%^&*+=.]{10,64})[\"']?",
+  "secret_group": 1,
+  "entropy": 3.5,
+  "keywords": ["password", "passwd", "db_pass", "user_pass", "admin_pass", "smtp_pass"],
+  "allowlist": {
+    "regexes": [
+      "^password$",
+      "^changeme",
+      "^your[_-]?password",
+      "^example",
+      "^placeholder",
+      "^x+$",
+      "^\\*+$",
+      "\\$\\{",
+      "^%[A-Z_]+%$"
+    ]
+  }
+}
   ]
 }
