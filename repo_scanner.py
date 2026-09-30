@@ -30,10 +30,12 @@ from supabase import create_client
 # CONFIG — edit these, then run:   python3 repo_scanner.py
 # ============================================================================
 
-# How many NEW repos to successfully scan this run. The script keeps pulling
-# more candidates from GitHub search until it hits this many successes.
-# Skipped (README-content) and failed repos do NOT count toward COUNT.
-COUNT = 100
+# How many findings to collect before stopping. This is the exit target.
+TARGET_FINDINGS = 50
+
+# Safety upper bound on repos scanned. Prevents infinite looping if the
+# search returns nothing useful but keeps yielding candidates.
+MAX_REPOS = 2000
 
 # Number of concurrent workers (download + scan in parallel).
 MAX_WORKERS = 5
@@ -211,8 +213,6 @@ def mask_secret(secret: str) -> str:
 
 
 def repo_has_readme_content(root: Path, min_chars: int) -> bool:
-    """True if the extracted repo root contains a README with at least
-    `min_chars` characters of non-whitespace text."""
     try:
         entries = list(root.iterdir())
     except OSError:
@@ -347,7 +347,6 @@ class CandidateSource:
         self.exhausted = False
 
     def fetch_more(self, want: int) -> list[dict]:
-        """Return up to `want` new candidates. May return fewer if exhausted."""
         while len(self.buffer) < want and not self.exhausted:
             items = self._fetch_page()
             if not items:
@@ -660,7 +659,7 @@ def get_session(token: str) -> requests.Session:
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "repo-secret-scanner/4.1",
+            "User-Agent": "repo-secret-scanner/4.2",
         })
         _thread_local.session = s
     return s
@@ -720,6 +719,23 @@ def scan_one_repo(meta: dict, token: str, workdir: Path,
 # main
 # --------------------------------------------------------------------------
 
+def _build_query() -> str:
+    parts = []
+    if USE_STARS_FILTER:
+        parts.append(f"stars:{MIN_STARS}..{MAX_STARS}")
+    if LANGUAGE:
+        parts.append(f"language:{LANGUAGE}")
+    if PUSHED_WITHIN_DAYS is not None and PUSHED_WITHIN_DAYS > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=PUSHED_WITHIN_DAYS))
+        parts.append(f"pushed:>={cutoff.strftime('%Y-%m-%d')}")
+    parts.append("is:public")
+    parts.append("archived:false")
+    parts.append("fork:false")
+    if EXTRA_QUERY:
+        parts.append(EXTRA_QUERY)
+    return " ".join(parts)
+
+
 def main() -> int:
     settings, rules = load_taxonomy(DEFAULT_TAXONOMY)
     wordlist = load_bip39()
@@ -743,9 +759,10 @@ def main() -> int:
     if SKIP_REPOS_WITH_README_CONTENT:
         log(f"skip repos with README content >= {README_CONTENT_MIN_CHARS} chars")
 
-    query = build_query() if False else _build_query()
+    query = _build_query()
     log(f"query: {query}")
-    log(f"target: {COUNT} successful scan(s), pushed within last "
+    log(f"target: {TARGET_FINDINGS} finding(s) "
+        f"(safety cap {MAX_REPOS} repos), pushed within last "
         f"{PUSHED_WITHIN_DAYS} day(s), {MAX_WORKERS} workers")
 
     discovery = requests.Session()
@@ -753,7 +770,7 @@ def main() -> int:
         "Authorization": f"Bearer {tokens[0]}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/4.1",
+        "User-Agent": "repo-secret-scanner/4.2",
     })
 
     source = CandidateSource(discovery, query, scanned)
@@ -763,15 +780,17 @@ def main() -> int:
     ok = 0
     failed = 0
     skipped = 0
+    target_reached = False
 
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures: dict = {}  # future -> meta
+            futures: dict = {}
+
+            def stop_condition() -> bool:
+                return target_reached or ok >= MAX_REPOS
 
             def submit_one() -> bool:
-                """Submit one more task if we still need successes and have
-                candidates. Returns False when we shouldn't submit anymore."""
-                if ok + len(futures) >= COUNT:
+                if stop_condition():
                     return False
                 batch = source.fetch_more(1)
                 if not batch:
@@ -800,9 +819,9 @@ def main() -> int:
                     try:
                         result = fut.result()
                     except Exception as e:
-                        log(f"worker crash on {meta.get('full_name')}: {e}")
+                        log(f"[fail] {meta.get('full_name')}: worker crash: {e}")
                         failed += 1
-                        if ok < COUNT:
+                        if not stop_condition():
                             submit_one()
                         continue
 
@@ -820,23 +839,31 @@ def main() -> int:
                         all_findings.extend(findings)
                         scanned.add(full_name)
                         ok += 1
-                        log(f"[{ok}/{COUNT}] {full_name} (★{stars}): "
-                            f"{len(findings)} finding(s)")
+                        new_total = len(all_findings)
+                        log(f"[{new_total}/{TARGET_FINDINGS} findings] "
+                            f"{full_name} (★{stars}): +{len(findings)}")
 
-                    # Refill pool if we still need successes
-                    if ok < COUNT:
+                        if new_total >= TARGET_FINDINGS:
+                            target_reached = True
+
+                    if not stop_condition():
                         submit_one()
 
         payload = build_payload(all_findings, ok)
         write_findings(payload, DEFAULT_OUT)
 
-        if ok < COUNT:
-            log(f"done: {ok}/{COUNT} scanned, {skipped} skipped (README), "
-                f"{failed} failed — search exhausted before target reached, "
-                f"{len(all_findings)} findings → {DEFAULT_OUT}")
+        if target_reached:
+            log(f"done: hit target {len(all_findings)}/{TARGET_FINDINGS} "
+                f"findings across {ok} scanned, {skipped} skipped (README), "
+                f"{failed} failed → {DEFAULT_OUT}")
+        elif source.exhausted:
+            log(f"done: search exhausted at {len(all_findings)}/"
+                f"{TARGET_FINDINGS} findings, {ok} scanned, "
+                f"{skipped} skipped (README), {failed} failed → {DEFAULT_OUT}")
         else:
-            log(f"done: {ok} scanned, {skipped} skipped (README), "
-                f"{failed} failed, {len(all_findings)} findings → {DEFAULT_OUT}")
+            log(f"done: safety cap reached at {ok}/{MAX_REPOS} repos, "
+                f"{len(all_findings)}/{TARGET_FINDINGS} findings, "
+                f"{skipped} skipped, {failed} failed → {DEFAULT_OUT}")
 
         if UPLOAD_FINDINGS:
             try:
@@ -849,23 +876,6 @@ def main() -> int:
         shutil.rmtree(workdir, ignore_errors=True)
 
     return 0
-
-
-def _build_query() -> str:
-    parts = []
-    if USE_STARS_FILTER:
-        parts.append(f"stars:{MIN_STARS}..{MAX_STARS}")
-    if LANGUAGE:
-        parts.append(f"language:{LANGUAGE}")
-    if PUSHED_WITHIN_DAYS is not None and PUSHED_WITHIN_DAYS > 0:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=PUSHED_WITHIN_DAYS))
-        parts.append(f"pushed:>={cutoff.strftime('%Y-%m-%d')}")
-    parts.append("is:public")
-    parts.append("archived:false")
-    parts.append("fork:false")
-    if EXTRA_QUERY:
-        parts.append(EXTRA_QUERY)
-    return " ".join(parts)
 
 
 if __name__ == "__main__":
