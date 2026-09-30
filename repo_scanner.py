@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,7 +30,9 @@ from supabase import create_client
 # CONFIG — edit these, then run:   python3 repo_scanner.py
 # ============================================================================
 
-# How many new repos to scan this run.
+# How many NEW repos to successfully scan this run. The script keeps pulling
+# more candidates from GitHub search until it hits this many successes.
+# Skipped (README-content) and failed repos do NOT count toward COUNT.
 COUNT = 100
 
 # Number of concurrent workers (download + scan in parallel).
@@ -49,6 +51,10 @@ PUSHED_WITHIN_DAYS = 7
 
 # Extra GitHub search qualifiers. Set to None to disable.
 EXTRA_QUERY = None           # e.g. "topic:iot"
+
+# Skip repos whose README contains real content. Empty/missing README → scan.
+SKIP_REPOS_WITH_README_CONTENT = True
+README_CONTENT_MIN_CHARS = 50
 
 # Push findings to Supabase gitbot.findings after the run completes.
 UPLOAD_FINDINGS = True
@@ -72,6 +78,12 @@ BIP39_TRIGGER_RULE = "bip39-mnemonic"
 BIP39_REPORT_RULE = "bip39-seed-phrase"
 
 RISK_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+# Filenames that count as a "README" at the repo root (case-insensitive).
+README_NAMES = (
+    "readme.md", "readme.markdown", "readme.rst", "readme.txt",
+    "readme", "readme.adoc",
+)
 
 
 def log(msg: str) -> None:
@@ -198,6 +210,27 @@ def mask_secret(secret: str) -> str:
     return f"{secret[:4]}…{secret[-4:]}"
 
 
+def repo_has_readme_content(root: Path, min_chars: int) -> bool:
+    """True if the extracted repo root contains a README with at least
+    `min_chars` characters of non-whitespace text."""
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return False
+    for p in entries:
+        if not p.is_file():
+            continue
+        if p.name.lower() not in README_NAMES:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if len("".join(text.split())) >= min_chars:
+            return True
+    return False
+
+
 # --------------------------------------------------------------------------
 # scanned-repo ledger
 # --------------------------------------------------------------------------
@@ -294,66 +327,66 @@ def load_bip39() -> set[str]:
 
 
 # --------------------------------------------------------------------------
-# repo discovery
+# candidate source (streams new repos until the search is exhausted)
 # --------------------------------------------------------------------------
 
-def build_query() -> str:
-    parts = []
-    if USE_STARS_FILTER:
-        parts.append(f"stars:{MIN_STARS}..{MAX_STARS}")
-    if LANGUAGE:
-        parts.append(f"language:{LANGUAGE}")
-    if PUSHED_WITHIN_DAYS is not None and PUSHED_WITHIN_DAYS > 0:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=PUSHED_WITHIN_DAYS))
-        parts.append(f"pushed:>={cutoff.strftime('%Y-%m-%d')}")
-    parts.append("is:public")
-    parts.append("archived:false")
-    parts.append("fork:false")
-    if EXTRA_QUERY:
-        parts.append(EXTRA_QUERY)
-    return " ".join(parts)
+class CandidateSource:
+    """Fetches fresh candidates from GitHub search, filtering out repos we've
+    already seen or already scanned, and buffering pages."""
 
+    MAX_PAGE = 20  # GitHub search hard caps at page 20 for authenticated users
 
-def search_repositories(
-    session: requests.Session,
-    query: str,
-    want: int,
-    scanned: ScannedRepos,
-) -> list[dict]:
-    chosen: list[dict] = []
-    seen: set[str] = set()
-    per_page = 50
+    def __init__(self, session: requests.Session, query: str,
+                 scanned: ScannedRepos) -> None:
+        self.session = session
+        self.query = query
+        self.scanned = scanned
+        self.attempted: set[str] = set()
+        self.buffer: list[dict] = []
+        self.page = 1
+        self.exhausted = False
 
-    for page in range(1, 21):
+    def fetch_more(self, want: int) -> list[dict]:
+        """Return up to `want` new candidates. May return fewer if exhausted."""
+        while len(self.buffer) < want and not self.exhausted:
+            items = self._fetch_page()
+            if not items:
+                self.exhausted = True
+                break
+            for it in items:
+                full = it["full_name"]
+                if full.lower() in self.attempted:
+                    continue
+                if self.scanned.contains(full):
+                    continue
+                self.attempted.add(full.lower())
+                self.buffer.append(it)
+        out = self.buffer[:want]
+        del self.buffer[:want]
+        return out
+
+    def _fetch_page(self) -> list[dict]:
+        if self.page > self.MAX_PAGE:
+            return []
         params = {
-            "q": query,
-            "per_page": per_page,
-            "page": page,
+            "q": self.query,
+            "per_page": 50,
+            "page": self.page,
             "sort": "updated",
             "order": "desc",
         }
-        r = session.get(f"{GITHUB_API}/search/repositories",
-                        params=params, timeout=30)
+        r = self.session.get(f"{GITHUB_API}/search/repositories",
+                             params=params, timeout=30)
         if r.status_code in (403, 429):
-            wait = int(r.headers.get("Retry-After") or 30)
-            log(f"  search rate-limited, sleeping {wait}s")
-            time.sleep(wait)
-            continue
+            wait_s = int(r.headers.get("Retry-After") or 30)
+            log(f"  search rate-limited, sleeping {wait_s}s")
+            time.sleep(wait_s)
+            return self._fetch_page()
         if r.status_code != 200:
-            log(f"  search HTTP {r.status_code}, stopping")
-            break
-        items = r.json().get("items", [])
-        if not items:
-            break
-        for it in items:
-            full = it["full_name"]
-            if scanned.contains(full) or full in seen:
-                continue
-            seen.add(full)
-            chosen.append(it)
-            if len(chosen) >= want:
-                return chosen
-    return chosen
+            log(f"  search HTTP {r.status_code}, marking exhausted")
+            return []
+        self.page += 1
+        return r.json().get("items", [])
 
 
 # --------------------------------------------------------------------------
@@ -424,10 +457,8 @@ def iter_candidate_files(root: Path, settings: Settings) -> Iterator[Path]:
             continue
         if p.suffix.lower() in settings.skip_extensions:
             continue
-        # Exact-filename match (case-insensitive) for extension-less docs
         if p.name.lower() in settings.skip_filenames:
             continue
-        # Also catch "README" without extension via stem comparison
         if p.stem.lower() in settings.skip_filenames:
             continue
         try:
@@ -629,7 +660,7 @@ def get_session(token: str) -> requests.Session:
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "repo-secret-scanner/3.9",
+            "User-Agent": "repo-secret-scanner/4.1",
         })
         _thread_local.session = s
     return s
@@ -649,6 +680,7 @@ def scan_one_repo(meta: dict, token: str, workdir: Path,
         "stars": stars,
         "findings": [],
         "error": None,
+        "skipped": False,
     }
 
     session = get_session(token)
@@ -669,6 +701,12 @@ def scan_one_repo(meta: dict, token: str, workdir: Path,
             if root is None:
                 result["error"] = "extract failed"
                 return result
+
+            if SKIP_REPOS_WITH_README_CONTENT:
+                if repo_has_readme_content(root, README_CONTENT_MIN_CHARS):
+                    result["skipped"] = True
+                    return result
+
             result["findings"] = scan_repo(
                 root, full_name, repo_url, rules, settings, wordlist
             )
@@ -702,10 +740,12 @@ def main() -> int:
     log(f"skip extensions: {len(settings.skip_extensions)} | "
         f"skip filenames: {len(settings.skip_filenames)} | "
         f"skip paths: {len(settings.skip_paths)}")
+    if SKIP_REPOS_WITH_README_CONTENT:
+        log(f"skip repos with README content >= {README_CONTENT_MIN_CHARS} chars")
 
-    query = build_query()
+    query = build_query() if False else _build_query()
     log(f"query: {query}")
-    log(f"want: {COUNT} new repo(s), pushed within last "
+    log(f"target: {COUNT} successful scan(s), pushed within last "
         f"{PUSHED_WITHIN_DAYS} day(s), {MAX_WORKERS} workers")
 
     discovery = requests.Session()
@@ -713,61 +753,90 @@ def main() -> int:
         "Authorization": f"Bearer {tokens[0]}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/3.9",
+        "User-Agent": "repo-secret-scanner/4.1",
     })
 
-    candidates = search_repositories(discovery, query, COUNT, scanned)
-    if not candidates:
-        log("no new repos matched the query")
-        return 0
-
-    log(f"found {len(candidates)} new repo(s) to scan")
+    source = CandidateSource(discovery, query, scanned)
     workdir = Path(tempfile.mkdtemp(prefix="repo_scan_"))
 
     all_findings: list[Finding] = []
     ok = 0
     failed = 0
-    completed = 0
+    skipped = 0
 
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = {}
-            for i, meta in enumerate(candidates):
-                tok = tokens[i % len(tokens)]
+            futures: dict = {}  # future -> meta
+
+            def submit_one() -> bool:
+                """Submit one more task if we still need successes and have
+                candidates. Returns False when we shouldn't submit anymore."""
+                if ok + len(futures) >= COUNT:
+                    return False
+                batch = source.fetch_more(1)
+                if not batch:
+                    return False
+                meta = batch[0]
+                tok = tokens[len(futures) % len(tokens)]
                 fut = pool.submit(
                     scan_one_repo, meta, tok, workdir,
                     rules, settings, wordlist
                 )
                 futures[fut] = meta
+                return True
 
-            for fut in as_completed(futures):
-                completed += 1
-                try:
-                    result = fut.result()
-                except Exception as e:
-                    log(f"[{completed}/{len(candidates)}] worker crash: {e}")
-                    failed += 1
-                    continue
+            # Prime the pool
+            for _ in range(MAX_WORKERS):
+                if not submit_one():
+                    break
 
-                full_name = result["full_name"]
-                stars = result["stars"]
-                tag = f"[{completed}/{len(candidates)}] {full_name} (★{stars})"
+            while futures:
+                done, _ = wait(list(futures.keys()),
+                               return_when=FIRST_COMPLETED)
 
-                if result["error"]:
-                    log(f"{tag}: {result['error']}")
-                    failed += 1
-                    continue
+                for fut in done:
+                    meta = futures.pop(fut)
 
-                findings = result["findings"]
-                all_findings.extend(findings)
-                scanned.add(full_name)
-                ok += 1
-                log(f"{tag}: {len(findings)} finding(s)")
+                    try:
+                        result = fut.result()
+                    except Exception as e:
+                        log(f"worker crash on {meta.get('full_name')}: {e}")
+                        failed += 1
+                        if ok < COUNT:
+                            submit_one()
+                        continue
+
+                    full_name = result["full_name"]
+                    stars = result["stars"]
+
+                    if result.get("skipped"):
+                        log(f"[skip] {full_name} (★{stars}): has README content")
+                        skipped += 1
+                    elif result["error"]:
+                        log(f"[fail] {full_name} (★{stars}): {result['error']}")
+                        failed += 1
+                    else:
+                        findings = result["findings"]
+                        all_findings.extend(findings)
+                        scanned.add(full_name)
+                        ok += 1
+                        log(f"[{ok}/{COUNT}] {full_name} (★{stars}): "
+                            f"{len(findings)} finding(s)")
+
+                    # Refill pool if we still need successes
+                    if ok < COUNT:
+                        submit_one()
 
         payload = build_payload(all_findings, ok)
         write_findings(payload, DEFAULT_OUT)
-        log(f"done: {ok} scanned, {failed} failed, "
-            f"{len(all_findings)} findings → {DEFAULT_OUT}")
+
+        if ok < COUNT:
+            log(f"done: {ok}/{COUNT} scanned, {skipped} skipped (README), "
+                f"{failed} failed — search exhausted before target reached, "
+                f"{len(all_findings)} findings → {DEFAULT_OUT}")
+        else:
+            log(f"done: {ok} scanned, {skipped} skipped (README), "
+                f"{failed} failed, {len(all_findings)} findings → {DEFAULT_OUT}")
 
         if UPLOAD_FINDINGS:
             try:
@@ -780,6 +849,23 @@ def main() -> int:
         shutil.rmtree(workdir, ignore_errors=True)
 
     return 0
+
+
+def _build_query() -> str:
+    parts = []
+    if USE_STARS_FILTER:
+        parts.append(f"stars:{MIN_STARS}..{MAX_STARS}")
+    if LANGUAGE:
+        parts.append(f"language:{LANGUAGE}")
+    if PUSHED_WITHIN_DAYS is not None and PUSHED_WITHIN_DAYS > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=PUSHED_WITHIN_DAYS))
+        parts.append(f"pushed:>={cutoff.strftime('%Y-%m-%d')}")
+    parts.append("is:public")
+    parts.append("archived:false")
+    parts.append("fork:false")
+    if EXTRA_QUERY:
+        parts.append(EXTRA_QUERY)
+    return " ".join(parts)
 
 
 if __name__ == "__main__":
