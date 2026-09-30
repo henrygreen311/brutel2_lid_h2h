@@ -30,29 +30,18 @@ from supabase import create_client
 # CONFIG — edit these, then run:   python3 repo_scanner.py
 # ============================================================================
 
-# How many findings to collect before stopping. This is the exit target.
+# How many findings to collect before stopping. Primary exit target.
 TARGET_FINDINGS = 50
 
-# Safety upper bound on repos scanned. Prevents infinite looping if the
-# search returns nothing useful but keeps yielding candidates.
-MAX_REPOS = 2000
+# Safety upper bound on repos scanned.
+MAX_REPOS = 5000
 
-# Number of concurrent workers (download + scan in parallel).
-MAX_WORKERS = 5
+# Number of concurrent workers.
+MAX_WORKERS = 8
 
 # Star range. Small repos (0..4) leak secrets the most.
-USE_STARS_FILTER = True
 MIN_STARS = 0
 MAX_STARS = 4
-
-# Language filter. Set to None to scan any language.
-LANGUAGE = None              # e.g. "python", "javascript", "go", "rust"
-
-# Only scan repos pushed within the last N days (from now).
-PUSHED_WITHIN_DAYS = 7
-
-# Extra GitHub search qualifiers. Set to None to disable.
-EXTRA_QUERY = None           # e.g. "topic:iot"
 
 # Skip repos whose README contains real content. Empty/missing README → scan.
 SKIP_REPOS_WITH_README_CONTENT = True
@@ -60,6 +49,54 @@ README_CONTENT_MIN_CHARS = 50
 
 # Push findings to Supabase gitbot.findings after the run completes.
 UPLOAD_FINDINGS = True
+
+# Extra GitHub search qualifiers applied to every query (None to disable).
+EXTRA_QUERY = None
+
+# ---------------------------------------------------------------------------
+# QUERY ROTATION
+#
+# Every query below uses stars:0..4 (hard limit, per requirement).
+# Rotation varies only the time window and language so each query returns
+# a different set of repos. When one query hits GitHub's 1000-result cap,
+# the script moves to the next. Repos already attempted are never retried.
+#
+# Order matters: tightest time window first, then widen.
+# ---------------------------------------------------------------------------
+QUERY_ROTATION = [
+    # Time-window sweeps (no language filter — broadest reach)
+    {"days": 1,   "language": None},
+    {"days": 3,   "language": None},
+    {"days": 7,   "language": None},
+    {"days": 14,  "language": None},
+    {"days": 21,  "language": None},
+    {"days": 30,  "language": None},
+    {"days": 45,  "language": None},
+    {"days": 60,  "language": None},
+    {"days": 90,  "language": None},
+
+    # Language sweeps on the 30-day window
+    {"days": 30,  "language": "python"},
+    {"days": 30,  "language": "javascript"},
+    {"days": 30,  "language": "typescript"},
+    {"days": 30,  "language": "go"},
+    {"days": 30,  "language": "java"},
+    {"days": 30,  "language": "php"},
+    {"days": 30,  "language": "ruby"},
+    {"days": 30,  "language": "csharp"},
+    {"days": 30,  "language": "kotlin"},
+    {"days": 30,  "language": "swift"},
+    {"days": 30,  "language": "rust"},
+    {"days": 30,  "language": "dart"},
+
+    # Language sweeps on the 90-day window (last resort)
+    {"days": 90,  "language": "python"},
+    {"days": 90,  "language": "javascript"},
+    {"days": 90,  "language": "typescript"},
+    {"days": 90,  "language": "go"},
+    {"days": 90,  "language": "java"},
+    {"days": 90,  "language": "php"},
+]
 
 # ============================================================================
 
@@ -81,7 +118,6 @@ BIP39_REPORT_RULE = "bip39-seed-phrase"
 
 RISK_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
-# Filenames that count as a "README" at the repo root (case-insensitive).
 README_NAMES = (
     "readme.md", "readme.markdown", "readme.rst", "readme.txt",
     "readme", "readme.adoc",
@@ -327,48 +363,61 @@ def load_bip39() -> set[str]:
 
 
 # --------------------------------------------------------------------------
-# candidate source (streams new repos until the search is exhausted)
+# candidate source with query rotation
 # --------------------------------------------------------------------------
 
+def build_query_from_spec(spec: dict) -> str:
+    parts = [f"stars:{MIN_STARS}..{MAX_STARS}"]
+    days = spec.get("days")
+    if days:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        parts.append(f"pushed:>={cutoff.strftime('%Y-%m-%d')}")
+    lang = spec.get("language")
+    if lang:
+        parts.append(f"language:{lang}")
+    parts.append("is:public")
+    parts.append("archived:false")
+    parts.append("fork:false")
+    if EXTRA_QUERY:
+        parts.append(EXTRA_QUERY)
+    return " ".join(parts)
+
+
 class CandidateSource:
-    """Fetches fresh candidates from GitHub search, filtering out repos we've
-    already seen or already scanned, and buffering pages."""
+    """Fetches fresh candidates from GitHub search across a rotation of
+    queries. When one query hits the 1000-result cap, moves to the next.
+    Repos already attempted (in this process or in the scanned ledger) are
+    never returned twice."""
 
-    MAX_PAGE = 20  # GitHub search hard caps at page 20 for authenticated users
+    MAX_PAGE = 20  # GitHub hard cap
 
-    def __init__(self, session: requests.Session, query: str,
+    def __init__(self, session: requests.Session, rotation: list[dict],
                  scanned: ScannedRepos) -> None:
         self.session = session
-        self.query = query
+        self.rotation = rotation
         self.scanned = scanned
         self.attempted: set[str] = set()
         self.buffer: list[dict] = []
+        self.rot_index = 0
         self.page = 1
-        self.exhausted = False
+        self.current_query = ""
+        self._start_query()
 
-    def fetch_more(self, want: int) -> list[dict]:
-        while len(self.buffer) < want and not self.exhausted:
-            items = self._fetch_page()
-            if not items:
-                self.exhausted = True
-                break
-            for it in items:
-                full = it["full_name"]
-                if full.lower() in self.attempted:
-                    continue
-                if self.scanned.contains(full):
-                    continue
-                self.attempted.add(full.lower())
-                self.buffer.append(it)
-        out = self.buffer[:want]
-        del self.buffer[:want]
-        return out
+    def _start_query(self) -> bool:
+        while self.rot_index < len(self.rotation):
+            spec = self.rotation[self.rot_index]
+            self.current_query = build_query_from_spec(spec)
+            self.page = 1
+            log(f"  [query {self.rot_index + 1}/{len(self.rotation)}] "
+                f"{self.current_query}")
+            return True
+        return False
 
     def _fetch_page(self) -> list[dict]:
         if self.page > self.MAX_PAGE:
             return []
         params = {
-            "q": self.query,
+            "q": self.current_query,
             "per_page": 50,
             "page": self.page,
             "sort": "updated",
@@ -381,11 +430,39 @@ class CandidateSource:
             log(f"  search rate-limited, sleeping {wait_s}s")
             time.sleep(wait_s)
             return self._fetch_page()
+        if r.status_code == 422:
+            log(f"  search unprocessable, rotating")
+            self.page = self.MAX_PAGE + 1
+            return []
         if r.status_code != 200:
-            log(f"  search HTTP {r.status_code}, marking exhausted")
+            log(f"  search HTTP {r.status_code}, rotating")
+            self.page = self.MAX_PAGE + 1
             return []
         self.page += 1
         return r.json().get("items", [])
+
+    def fetch_more(self, want: int) -> list[dict]:
+        while len(self.buffer) < want:
+            items = self._fetch_page()
+
+            if not items:
+                self.rot_index += 1
+                if not self._start_query():
+                    break
+                continue
+
+            for it in items:
+                full = it["full_name"]
+                if full.lower() in self.attempted:
+                    continue
+                if self.scanned.contains(full):
+                    continue
+                self.attempted.add(full.lower())
+                self.buffer.append(it)
+
+        out = self.buffer[:want]
+        del self.buffer[:want]
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -659,7 +736,7 @@ def get_session(token: str) -> requests.Session:
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "repo-secret-scanner/4.2",
+            "User-Agent": "repo-secret-scanner/4.4",
         })
         _thread_local.session = s
     return s
@@ -719,23 +796,6 @@ def scan_one_repo(meta: dict, token: str, workdir: Path,
 # main
 # --------------------------------------------------------------------------
 
-def _build_query() -> str:
-    parts = []
-    if USE_STARS_FILTER:
-        parts.append(f"stars:{MIN_STARS}..{MAX_STARS}")
-    if LANGUAGE:
-        parts.append(f"language:{LANGUAGE}")
-    if PUSHED_WITHIN_DAYS is not None and PUSHED_WITHIN_DAYS > 0:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=PUSHED_WITHIN_DAYS))
-        parts.append(f"pushed:>={cutoff.strftime('%Y-%m-%d')}")
-    parts.append("is:public")
-    parts.append("archived:false")
-    parts.append("fork:false")
-    if EXTRA_QUERY:
-        parts.append(EXTRA_QUERY)
-    return " ".join(parts)
-
-
 def main() -> int:
     settings, rules = load_taxonomy(DEFAULT_TAXONOMY)
     wordlist = load_bip39()
@@ -758,22 +818,21 @@ def main() -> int:
         f"skip paths: {len(settings.skip_paths)}")
     if SKIP_REPOS_WITH_README_CONTENT:
         log(f"skip repos with README content >= {README_CONTENT_MIN_CHARS} chars")
-
-    query = _build_query()
-    log(f"query: {query}")
-    log(f"target: {TARGET_FINDINGS} finding(s) "
-        f"(safety cap {MAX_REPOS} repos), pushed within last "
-        f"{PUSHED_WITHIN_DAYS} day(s), {MAX_WORKERS} workers")
+    log(f"star range: {MIN_STARS}..{MAX_STARS} (fixed) | "
+        f"target: {TARGET_FINDINGS} finding(s) | "
+        f"safety cap {MAX_REPOS} repos | "
+        f"{MAX_WORKERS} workers | "
+        f"{len(QUERY_ROTATION)} queries in rotation")
 
     discovery = requests.Session()
     discovery.headers.update({
         "Authorization": f"Bearer {tokens[0]}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/4.2",
+        "User-Agent": "repo-secret-scanner/4.4",
     })
 
-    source = CandidateSource(discovery, query, scanned)
+    source = CandidateSource(discovery, QUERY_ROTATION, scanned)
     workdir = Path(tempfile.mkdtemp(prefix="repo_scan_"))
 
     all_findings: list[Finding] = []
@@ -804,7 +863,6 @@ def main() -> int:
                 futures[fut] = meta
                 return True
 
-            # Prime the pool
             for _ in range(MAX_WORKERS):
                 if not submit_one():
                     break
@@ -829,10 +887,8 @@ def main() -> int:
                     stars = result["stars"]
 
                     if result.get("skipped"):
-                        log(f"[skip] {full_name} (★{stars}): has README content")
                         skipped += 1
                     elif result["error"]:
-                        log(f"[fail] {full_name} (★{stars}): {result['error']}")
                         failed += 1
                     else:
                         findings = result["findings"]
@@ -856,14 +912,10 @@ def main() -> int:
             log(f"done: hit target {len(all_findings)}/{TARGET_FINDINGS} "
                 f"findings across {ok} scanned, {skipped} skipped (README), "
                 f"{failed} failed → {DEFAULT_OUT}")
-        elif source.exhausted:
-            log(f"done: search exhausted at {len(all_findings)}/"
+        else:
+            log(f"done: all queries exhausted at {len(all_findings)}/"
                 f"{TARGET_FINDINGS} findings, {ok} scanned, "
                 f"{skipped} skipped (README), {failed} failed → {DEFAULT_OUT}")
-        else:
-            log(f"done: safety cap reached at {ok}/{MAX_REPOS} repos, "
-                f"{len(all_findings)}/{TARGET_FINDINGS} findings, "
-                f"{skipped} skipped, {failed} failed → {DEFAULT_OUT}")
 
         if UPLOAD_FINDINGS:
             try:
