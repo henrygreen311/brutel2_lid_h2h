@@ -246,6 +246,7 @@ class Settings:
     min_entropy: float
     max_file_size_kb: int
     skip_extensions: tuple[str, ...]
+    skip_filenames: tuple[str, ...]
     skip_paths: tuple[str, ...]
 
 
@@ -256,6 +257,7 @@ def load_taxonomy(path: Path) -> tuple[Settings, list[Rule]]:
         min_entropy=float(s.get("min_entropy", 3.0)),
         max_file_size_kb=int(s.get("max_file_size_kb", 2048)),
         skip_extensions=tuple(e.lower() for e in s.get("skip_extensions", [])),
+        skip_filenames=tuple(n.lower() for n in s.get("skip_filenames", [])),
         skip_paths=tuple(p.replace("\\", "/") for p in s.get("skip_paths", [])),
     )
 
@@ -421,6 +423,12 @@ def iter_candidate_files(root: Path, settings: Settings) -> Iterator[Path]:
         if any(skip in rel for skip in settings.skip_paths):
             continue
         if p.suffix.lower() in settings.skip_extensions:
+            continue
+        # Exact-filename match (case-insensitive) for extension-less docs
+        if p.name.lower() in settings.skip_filenames:
+            continue
+        # Also catch "README" without extension via stem comparison
+        if p.stem.lower() in settings.skip_filenames:
             continue
         try:
             if p.stat().st_size > settings.max_file_size_kb * 1024:
@@ -621,7 +629,7 @@ def get_session(token: str) -> requests.Session:
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "repo-secret-scanner/3.8",
+            "User-Agent": "repo-secret-scanner/3.9",
         })
         _thread_local.session = s
     return s
@@ -691,6 +699,9 @@ def main() -> int:
     scanned = ScannedRepos(DEFAULT_SCANNED)
     log(f"{len(rules)} rules | {len(wordlist)} BIP39 words | "
         f"{len(tokens)} token(s) | {len(scanned.seen)} repos already scanned")
+    log(f"skip extensions: {len(settings.skip_extensions)} | "
+        f"skip filenames: {len(settings.skip_filenames)} | "
+        f"skip paths: {len(settings.skip_paths)}")
 
     query = build_query()
     log(f"query: {query}")
@@ -702,7 +713,7 @@ def main() -> int:
         "Authorization": f"Bearer {tokens[0]}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/3.8",
+        "User-Agent": "repo-secret-scanner/3.9",
     })
 
     candidates = search_repositories(discovery, query, COUNT, scanned)

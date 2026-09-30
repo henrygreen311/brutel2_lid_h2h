@@ -2,23 +2,31 @@
   "version": "2.0",
   "usage_restriction": "Detection rules for a repo-level secret scanner. Each rule combines a regex (with a capture group identifying the secret) with an optional Shannon-entropy threshold and a keyword pre-filter. Rules are checked against file contents; a keyword hit is only a hint that a rule *might* apply — the regex and entropy gate then decide whether a finding is real. Inspired by gitleaks/trufflehog rule shapes.",
   "settings": {
-    "min_entropy": 3.0,
-    "max_file_size_kb": 2048,
-    "skip_extensions": [
-      ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg",
-      ".pdf", ".zip", ".gz", ".tgz", ".tar", ".rar", ".7z", ".bz2", ".xz",
-      ".mp3", ".mp4", ".wav", ".ogg", ".mov", ".avi", ".mkv",
-      ".woff", ".woff2", ".ttf", ".eot", ".otf",
-      ".exe", ".dll", ".so", ".dylib", ".bin", ".class", ".jar", ".war",
-      ".pyc", ".pyo", ".o", ".a", ".obj", ".wasm",
-      ".lock", ".sum", ".map"
-    ],
-    "skip_paths": [
-      "/.git/", "/node_modules/", "/vendor/", "/dist/", "/build/",
-      "/.venv/", "/venv/", "/__pycache__/", "/.mypy_cache/",
-      "/target/", "/bin/", "/obj/", "/coverage/", "/.next/", "/.nuxt/"
-    ]
-  },
+  "min_entropy": 3.0,
+  "max_file_size_kb": 2048,
+  "skip_extensions": [
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg",
+    ".pdf", ".zip", ".gz", ".tgz", ".tar", ".rar", ".7z", ".bz2", ".xz",
+    ".mp3", ".mp4", ".wav", ".ogg", ".mov", ".avi", ".mkv",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".class", ".jar", ".war",
+    ".pyc", ".pyo", ".o", ".a", ".obj", ".wasm",
+    ".lock", ".sum", ".map",
+    ".md", ".markdown", ".mdx", ".rst", ".txt", ".adoc", ".asciidoc", ".org",
+    ".example", ".sample", ".template", ".tmpl", ".dist",
+    ".log", ".bak", ".old", ".orig", ".rej"
+  ],
+  "skip_filenames": [
+    "readme", "license", "licence", "changelog", "changes",
+    "contributing", "code_of_conduct", "authors", "notice",
+    "copying", "install", "todo", "faq", "news", "history"
+  ],
+  "skip_paths": [
+    "/.git/", "/node_modules/", "/vendor/", "/dist/", "/build/",
+    "/.venv/", "/venv/", "/__pycache__/", "/.mypy_cache/",
+    "/target/", "/bin/", "/obj/", "/coverage/", "/.next/", "/.nuxt/"
+  ]
+},
   "rules": [
     {
       "id": "aws-access-key-id",
