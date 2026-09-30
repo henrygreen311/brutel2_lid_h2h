@@ -8,11 +8,14 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,7 +31,10 @@ from supabase import create_client
 # ============================================================================
 
 # How many new repos to scan this run.
-COUNT = 20
+COUNT = 100
+
+# Number of concurrent workers (download + scan in parallel).
+MAX_WORKERS = 5
 
 # Star range. Small repos (0..4) leak secrets the most.
 USE_STARS_FILTER = True
@@ -44,7 +50,7 @@ PUSHED_WITHIN_DAYS = 7
 # Extra GitHub search qualifiers. Set to None to disable.
 EXTRA_QUERY = None           # e.g. "topic:iot"
 
-# Push findings to Supabase gitbot.findings after the run.
+# Push findings to Supabase gitbot.findings after the run completes.
 UPLOAD_FINDINGS = True
 
 # ============================================================================
@@ -179,9 +185,6 @@ def is_probably_binary(data: bytes) -> bool:
 
 
 def is_mostly_non_ascii(data: bytes, threshold: float = 0.60) -> bool:
-    """True if the file is dominated by non-ASCII bytes. Catches CJK spam
-    payloads (SEO garbage) while keeping normal source code — even with
-    non-English comments — in scope."""
     sample = data[:16384]
     if not sample:
         return False
@@ -319,7 +322,7 @@ def search_repositories(
     seen: set[str] = set()
     per_page = 50
 
-    for page in range(1, 11):
+    for page in range(1, 21):
         params = {
             "q": query,
             "per_page": per_page,
@@ -406,6 +409,7 @@ class Finding:
     secret_masked: str
     entropy: float
     snippet: str
+    occurrences: int = 1
 
 
 def iter_candidate_files(root: Path, settings: Settings) -> Iterator[Path]:
@@ -552,9 +556,16 @@ def _iter_bip39_runs(text: str,
 def scan_repo(root: Path, repo_full_name: str, repo_url: str,
               rules: list[Rule], settings: Settings,
               wordlist: set[str]) -> list[Finding]:
-    findings: list[Finding] = []
-    dedup: set[tuple[str, str, str]] = set()
+    dedup: dict[tuple[str, str], Finding] = {}
     trigger_bip39 = False
+
+    def add_finding(finding: Finding) -> None:
+        key = (finding.rule_id, finding.secret_masked)
+        existing = dedup.get(key)
+        if existing is None:
+            dedup[key] = finding
+        else:
+            existing.occurrences += 1
 
     for f in iter_candidate_files(root, settings):
         rel = f.relative_to(root).as_posix()
@@ -563,59 +574,105 @@ def scan_repo(root: Path, repo_full_name: str, repo_url: str,
         )
         trigger_bip39 = trigger_bip39 or triggered
         for finding in file_findings:
-            key = (finding.rule_id, finding.file, finding.secret_masked)
-            if key in dedup:
-                continue
-            dedup.add(key)
-            findings.append(finding)
+            add_finding(finding)
 
     if trigger_bip39 and wordlist:
         for finding in bip39_phrase_findings(
             root, settings, wordlist, repo_full_name, repo_url
         ):
-            key = (finding.rule_id, finding.file, finding.secret_masked)
-            if key in dedup:
-                continue
-            dedup.add(key)
-            findings.append(finding)
+            add_finding(finding)
 
-    return findings
+    return list(dedup.values())
 
 
 # --------------------------------------------------------------------------
 # reporting
 # --------------------------------------------------------------------------
 
-def write_findings(findings: list[Finding], repos_scanned: int,
-                   out_path: Path) -> dict:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    findings.sort(key=lambda f: (
+def build_payload(findings: list[Finding], repos_scanned: int) -> dict:
+    sorted_findings = sorted(findings, key=lambda f: (
         RISK_RANK.get(f.risk, 9), f.repo, f.file, f.line
     ))
-    payload = {
+    return {
         "scanned_at": now_iso(),
         "repos_scanned": repos_scanned,
-        "total_findings": len(findings),
-        "findings": [asdict(f) for f in findings],
+        "total_findings": len(sorted_findings),
+        "findings": [asdict(f) for f in sorted_findings],
     }
+
+
+def write_findings(payload: dict, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return payload
+
+
+# --------------------------------------------------------------------------
+# worker (thread-local session)
+# --------------------------------------------------------------------------
+
+_thread_local = threading.local()
+
+
+def get_session(token: str) -> requests.Session:
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "repo-secret-scanner/3.8",
+        })
+        _thread_local.session = s
+    return s
+
+
+def scan_one_repo(meta: dict, token: str, workdir: Path,
+                  rules: list[Rule], settings: Settings,
+                  wordlist: set[str]) -> dict:
+    full_name = meta["full_name"]
+    repo_url = meta["html_url"]
+    stars = meta.get("stargazers_count", 0)
+    branch = meta.get("default_branch") or "main"
+
+    result = {
+        "full_name": full_name,
+        "repo_url": repo_url,
+        "stars": stars,
+        "findings": [],
+        "error": None,
+    }
+
+    session = get_session(token)
+
+    try:
+        blob = download_tarball(session, full_name, branch)
+    except Exception as e:
+        result["error"] = f"download error: {e}"
+        return result
+
+    if blob is None:
+        result["error"] = "download failed"
+        return result
+
+    try:
+        with tempfile.TemporaryDirectory(dir=workdir) as tmp:
+            root = extract_tarball(blob, Path(tmp))
+            if root is None:
+                result["error"] = "extract failed"
+                return result
+            result["findings"] = scan_repo(
+                root, full_name, repo_url, rules, settings, wordlist
+            )
+    except Exception as e:
+        result["error"] = f"scan error: {e}"
+
+    return result
 
 
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
-
-def build_session(token: str) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/3.4",
-    })
-    return s
-
 
 def main() -> int:
     settings, rules = load_taxonomy(DEFAULT_TAXONOMY)
@@ -638,57 +695,78 @@ def main() -> int:
     query = build_query()
     log(f"query: {query}")
     log(f"want: {COUNT} new repo(s), pushed within last "
-        f"{PUSHED_WITHIN_DAYS} day(s)")
+        f"{PUSHED_WITHIN_DAYS} day(s), {MAX_WORKERS} workers")
 
-    session = build_session(tokens[0])
-    candidates = search_repositories(session, query, COUNT, scanned)
+    discovery = requests.Session()
+    discovery.headers.update({
+        "Authorization": f"Bearer {tokens[0]}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "repo-secret-scanner/3.8",
+    })
+
+    candidates = search_repositories(discovery, query, COUNT, scanned)
     if not candidates:
         log("no new repos matched the query")
         return 0
 
     log(f"found {len(candidates)} new repo(s) to scan")
     workdir = Path(tempfile.mkdtemp(prefix="repo_scan_"))
+
     all_findings: list[Finding] = []
     ok = 0
     failed = 0
+    completed = 0
 
-    for i, meta in enumerate(candidates, 1):
-        full_name = meta["full_name"]
-        repo_url = meta["html_url"]
-        stars = meta.get("stargazers_count", 0)
-        branch = meta.get("default_branch") or "main"
-        tag = f"[{i}/{len(candidates)}] {full_name} (★{stars})"
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {}
+            for i, meta in enumerate(candidates):
+                tok = tokens[i % len(tokens)]
+                fut = pool.submit(
+                    scan_one_repo, meta, tok, workdir,
+                    rules, settings, wordlist
+                )
+                futures[fut] = meta
 
-        blob = download_tarball(session, full_name, branch)
-        if blob is None:
-            log(f"{tag}: download failed")
-            failed += 1
-            continue
+            for fut in as_completed(futures):
+                completed += 1
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    log(f"[{completed}/{len(candidates)}] worker crash: {e}")
+                    failed += 1
+                    continue
 
-        with tempfile.TemporaryDirectory(dir=workdir) as tmp:
-            root = extract_tarball(blob, Path(tmp))
-            if root is None:
-                log(f"{tag}: extract failed")
-                failed += 1
-                continue
+                full_name = result["full_name"]
+                stars = result["stars"]
+                tag = f"[{completed}/{len(candidates)}] {full_name} (★{stars})"
 
-            findings = scan_repo(root, full_name, repo_url, rules,
-                                 settings, wordlist)
-            all_findings.extend(findings)
-            scanned.add(full_name)
-            ok += 1
-            log(f"{tag}: {len(findings)} finding(s)")
+                if result["error"]:
+                    log(f"{tag}: {result['error']}")
+                    failed += 1
+                    continue
 
-    payload = write_findings(all_findings, ok, DEFAULT_OUT)
-    log(f"done: {ok} scanned, {failed} failed, "
-        f"{len(all_findings)} findings → {DEFAULT_OUT}")
+                findings = result["findings"]
+                all_findings.extend(findings)
+                scanned.add(full_name)
+                ok += 1
+                log(f"{tag}: {len(findings)} finding(s)")
 
-    if UPLOAD_FINDINGS:
-        try:
-            push_findings_to_gitbot(payload)
-            log("findings uploaded to Supabase gitbot.findings")
-        except Exception as e:
-            log(f"warning: failed to upload findings to Supabase: {e}")
+        payload = build_payload(all_findings, ok)
+        write_findings(payload, DEFAULT_OUT)
+        log(f"done: {ok} scanned, {failed} failed, "
+            f"{len(all_findings)} findings → {DEFAULT_OUT}")
+
+        if UPLOAD_FINDINGS:
+            try:
+                push_findings_to_gitbot(payload)
+                log("findings pushed to Supabase gitbot.findings")
+            except Exception as e:
+                log(f"warning: Supabase push failed: {e}")
+
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
     return 0
 
