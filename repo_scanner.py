@@ -31,6 +31,9 @@ from supabase import create_client
 # ============================================================================
 
 # How many findings to collect before stopping. Primary exit target.
+# The instant this is reached, in-flight tasks are abandoned and the script
+# writes results and exits. Overshoot is capped at MAX_WORKERS - 1 extra
+# repos (the ones already running when the target was hit).
 TARGET_FINDINGS = 50
 
 # Safety upper bound on repos scanned.
@@ -56,15 +59,12 @@ EXTRA_QUERY = None
 # ---------------------------------------------------------------------------
 # QUERY ROTATION
 #
-# Every query below uses stars:0..4 (hard limit, per requirement).
+# Every query below uses stars:0..4 (hard limit).
 # Rotation varies only the time window and language so each query returns
 # a different set of repos. When one query hits GitHub's 1000-result cap,
 # the script moves to the next. Repos already attempted are never retried.
-#
-# Order matters: tightest time window first, then widen.
 # ---------------------------------------------------------------------------
 QUERY_ROTATION = [
-    # Time-window sweeps (no language filter — broadest reach)
     {"days": 1,   "language": None},
     {"days": 3,   "language": None},
     {"days": 7,   "language": None},
@@ -75,7 +75,6 @@ QUERY_ROTATION = [
     {"days": 60,  "language": None},
     {"days": 90,  "language": None},
 
-    # Language sweeps on the 30-day window
     {"days": 30,  "language": "python"},
     {"days": 30,  "language": "javascript"},
     {"days": 30,  "language": "typescript"},
@@ -89,7 +88,6 @@ QUERY_ROTATION = [
     {"days": 30,  "language": "rust"},
     {"days": 30,  "language": "dart"},
 
-    # Language sweeps on the 90-day window (last resort)
     {"days": 90,  "language": "python"},
     {"days": 90,  "language": "javascript"},
     {"days": 90,  "language": "typescript"},
@@ -126,6 +124,7 @@ README_NAMES = (
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr)
+    sys.stderr.flush()
 
 
 # --------------------------------------------------------------------------
@@ -384,12 +383,7 @@ def build_query_from_spec(spec: dict) -> str:
 
 
 class CandidateSource:
-    """Fetches fresh candidates from GitHub search across a rotation of
-    queries. When one query hits the 1000-result cap, moves to the next.
-    Repos already attempted (in this process or in the scanned ledger) are
-    never returned twice."""
-
-    MAX_PAGE = 20  # GitHub hard cap
+    MAX_PAGE = 20
 
     def __init__(self, session: requests.Session, rotation: list[dict],
                  scanned: ScannedRepos) -> None:
@@ -444,13 +438,11 @@ class CandidateSource:
     def fetch_more(self, want: int) -> list[dict]:
         while len(self.buffer) < want:
             items = self._fetch_page()
-
             if not items:
                 self.rot_index += 1
                 if not self._start_query():
                     break
                 continue
-
             for it in items:
                 full = it["full_name"]
                 if full.lower() in self.attempted:
@@ -459,7 +451,6 @@ class CandidateSource:
                     continue
                 self.attempted.add(full.lower())
                 self.buffer.append(it)
-
         out = self.buffer[:want]
         del self.buffer[:want]
         return out
@@ -478,7 +469,7 @@ def download_tarball(session: requests.Session, full_name: str,
         tried.add(ref)
         url = f"{CODELOAD}/{full_name}/tar.gz/refs/heads/{ref}"
         try:
-            r = session.get(url, timeout=180, allow_redirects=True)
+            r = session.get(url, timeout=90, allow_redirects=True)
         except requests.RequestException:
             continue
         if r.status_code == 200 and r.content:
@@ -736,7 +727,7 @@ def get_session(token: str) -> requests.Session:
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "repo-secret-scanner/4.4",
+            "User-Agent": "repo-secret-scanner/4.5",
         })
         _thread_local.session = s
     return s
@@ -813,11 +804,6 @@ def main() -> int:
     scanned = ScannedRepos(DEFAULT_SCANNED)
     log(f"{len(rules)} rules | {len(wordlist)} BIP39 words | "
         f"{len(tokens)} token(s) | {len(scanned.seen)} repos already scanned")
-    log(f"skip extensions: {len(settings.skip_extensions)} | "
-        f"skip filenames: {len(settings.skip_filenames)} | "
-        f"skip paths: {len(settings.skip_paths)}")
-    if SKIP_REPOS_WITH_README_CONTENT:
-        log(f"skip repos with README content >= {README_CONTENT_MIN_CHARS} chars")
     log(f"star range: {MIN_STARS}..{MAX_STARS} (fixed) | "
         f"target: {TARGET_FINDINGS} finding(s) | "
         f"safety cap {MAX_REPOS} repos | "
@@ -829,7 +815,7 @@ def main() -> int:
         "Authorization": f"Bearer {tokens[0]}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/4.4",
+        "User-Agent": "repo-secret-scanner/4.5",
     })
 
     source = CandidateSource(discovery, QUERY_ROTATION, scanned)
@@ -840,99 +826,123 @@ def main() -> int:
     failed = 0
     skipped = 0
     target_reached = False
+    abandoned = 0
+
+    pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    futures: dict = {}
 
     try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures: dict = {}
+        def stop_condition() -> bool:
+            return target_reached or ok >= MAX_REPOS
 
-            def stop_condition() -> bool:
-                return target_reached or ok >= MAX_REPOS
+        def submit_one() -> bool:
+            if stop_condition():
+                return False
+            batch = source.fetch_more(1)
+            if not batch:
+                return False
+            meta = batch[0]
+            tok = tokens[len(futures) % len(tokens)]
+            fut = pool.submit(
+                scan_one_repo, meta, tok, workdir,
+                rules, settings, wordlist
+            )
+            futures[fut] = meta
+            return True
 
-            def submit_one() -> bool:
-                if stop_condition():
-                    return False
-                batch = source.fetch_more(1)
-                if not batch:
-                    return False
-                meta = batch[0]
-                tok = tokens[len(futures) % len(tokens)]
-                fut = pool.submit(
-                    scan_one_repo, meta, tok, workdir,
-                    rules, settings, wordlist
-                )
-                futures[fut] = meta
-                return True
+        # Prime the pool
+        for _ in range(MAX_WORKERS):
+            if not submit_one():
+                break
 
-            for _ in range(MAX_WORKERS):
-                if not submit_one():
-                    break
+        # Process completions until target, cap, or exhaustion
+        while futures and not stop_condition():
+            done, _ = wait(list(futures.keys()), return_when=FIRST_COMPLETED)
 
-            while futures:
-                done, _ = wait(list(futures.keys()),
-                               return_when=FIRST_COMPLETED)
+            for fut in done:
+                meta = futures.pop(fut)
 
-                for fut in done:
-                    meta = futures.pop(fut)
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    log(f"[fail] {meta.get('full_name')}: worker crash: {e}")
+                    failed += 1
+                    continue
 
-                    try:
-                        result = fut.result()
-                    except Exception as e:
-                        log(f"[fail] {meta.get('full_name')}: worker crash: {e}")
-                        failed += 1
-                        if not stop_condition():
-                            submit_one()
-                        continue
+                full_name = result["full_name"]
+                stars = result["stars"]
 
-                    full_name = result["full_name"]
-                    stars = result["stars"]
+                if result.get("skipped"):
+                    skipped += 1
+                elif result["error"]:
+                    failed += 1
+                else:
+                    findings = result["findings"]
+                    all_findings.extend(findings)
+                    scanned.add(full_name)
+                    ok += 1
+                    new_total = len(all_findings)
+                    log(f"[{new_total}/{TARGET_FINDINGS} findings] "
+                        f"{full_name} (★{stars}): +{len(findings)}")
 
-                    if result.get("skipped"):
-                        skipped += 1
-                    elif result["error"]:
-                        failed += 1
-                    else:
-                        findings = result["findings"]
-                        all_findings.extend(findings)
-                        scanned.add(full_name)
-                        ok += 1
-                        new_total = len(all_findings)
-                        log(f"[{new_total}/{TARGET_FINDINGS} findings] "
-                            f"{full_name} (★{stars}): +{len(findings)}")
+                    if new_total >= TARGET_FINDINGS:
+                        target_reached = True
+                        break
 
-                        if new_total >= TARGET_FINDINGS:
-                            target_reached = True
+            # Only refill when we haven't hit the target
+            if not stop_condition():
+                while len(futures) < MAX_WORKERS:
+                    if not submit_one():
+                        break
 
-                    if not stop_condition():
-                        submit_one()
-
-        payload = build_payload(all_findings, ok)
-        write_findings(payload, DEFAULT_OUT)
-
-        if target_reached:
-            log(f"done: hit target {len(all_findings)}/{TARGET_FINDINGS} "
-                f"findings across {ok} scanned, {skipped} skipped (README), "
-                f"{failed} failed → {DEFAULT_OUT}")
-        else:
-            log(f"done: all queries exhausted at {len(all_findings)}/"
-                f"{TARGET_FINDINGS} findings, {ok} scanned, "
-                f"{skipped} skipped (README), {failed} failed → {DEFAULT_OUT}")
-
-        if UPLOAD_FINDINGS:
-            try:
-                push_findings_to_gitbot(payload)
-                log("findings pushed to Supabase gitbot.findings")
-            except Exception as e:
-                log(f"warning: Supabase push failed: {e}")
+        # If we stopped because of target/cap, count remaining in-flight
+        # tasks as abandoned — we don't wait for them.
+        if stop_condition():
+            abandoned = len(futures)
+            if abandoned:
+                log(f"target reached; abandoning {abandoned} in-flight task(s)")
 
     finally:
+        # Never wait for pool threads — cancel queued, drop running.
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         shutil.rmtree(workdir, ignore_errors=True)
 
-    return 0
+    payload = build_payload(all_findings, ok)
+    write_findings(payload, DEFAULT_OUT)
+
+    if target_reached:
+        log(f"done: hit target {len(all_findings)}/{TARGET_FINDINGS} "
+            f"findings across {ok} scanned, {skipped} skipped (README), "
+            f"{failed} failed, {abandoned} abandoned → {DEFAULT_OUT}")
+    elif source.rot_index >= len(source.rotation):
+        log(f"done: all queries exhausted at {len(all_findings)}/"
+            f"{TARGET_FINDINGS} findings, {ok} scanned, "
+            f"{skipped} skipped (README), {failed} failed → {DEFAULT_OUT}")
+    else:
+        log(f"done: safety cap reached at {ok}/{MAX_REPOS} repos, "
+            f"{len(all_findings)}/{TARGET_FINDINGS} findings, "
+            f"{skipped} skipped, {failed} failed → {DEFAULT_OUT}")
+
+    if UPLOAD_FINDINGS:
+        try:
+            push_findings_to_gitbot(payload)
+            log("findings pushed to Supabase gitbot.findings")
+        except Exception as e:
+            log(f"warning: Supabase push failed: {e}")
+
+    # Hard exit — do not let Python join any lingering pool threads stuck
+    # on slow downloads. All output is flushed, all state is written.
+    sys.stderr.flush()
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        main()
     except KeyboardInterrupt:
         print("shutdown")
-        sys.exit(130)
+        os._exit(130)
