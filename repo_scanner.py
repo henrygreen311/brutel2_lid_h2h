@@ -30,11 +30,12 @@ from supabase import create_client
 # CONFIG — edit these, then run:   python3 repo_scanner.py
 # ============================================================================
 
-# How many findings to collect before stopping. Primary exit target.
-# The instant this is reached, in-flight tasks are abandoned and the script
-# writes results and exits. Overshoot is capped at MAX_WORKERS - 1 extra
-# repos (the ones already running when the target was hit).
+# How many findings to collect before stopping.
 TARGET_FINDINGS = 50
+
+# Push findings to Supabase every N new findings.
+# Also writes bug/findings.json in the same tick.
+PUSH_EVERY_N_FINDINGS = 5
 
 # Safety upper bound on repos scanned.
 MAX_REPOS = 5000
@@ -46,11 +47,11 @@ MAX_WORKERS = 8
 MIN_STARS = 0
 MAX_STARS = 4
 
-# Skip repos whose README contains real content. Empty/missing README → scan.
+# Skip repos whose README contains real content.
 SKIP_REPOS_WITH_README_CONTENT = True
 README_CONTENT_MIN_CHARS = 50
 
-# Push findings to Supabase gitbot.findings after the run completes.
+# Push findings to Supabase (set False for a dry run without DB writes).
 UPLOAD_FINDINGS = True
 
 # Extra GitHub search qualifiers applied to every query (None to disable).
@@ -58,11 +59,6 @@ EXTRA_QUERY = None
 
 # ---------------------------------------------------------------------------
 # QUERY ROTATION
-#
-# Every query below uses stars:0..4 (hard limit).
-# Rotation varies only the time window and language so each query returns
-# a different set of repos. When one query hits GitHub's 1000-result cap,
-# the script moves to the next. Repos already attempted are never retried.
 # ---------------------------------------------------------------------------
 QUERY_ROTATION = [
     {"days": 1,   "language": None},
@@ -709,7 +705,33 @@ def build_payload(findings: list[Finding], repos_scanned: int) -> dict:
 
 def write_findings(payload: dict, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Atomic write — never leave a half-written file on crash
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(out_path)
+
+
+def flush_findings(findings: list[Finding], repos_scanned: int,
+                   reason: str) -> bool:
+    """Write findings to disk and Supabase. Returns True on success."""
+    payload = build_payload(findings, repos_scanned)
+    try:
+        write_findings(payload, DEFAULT_OUT)
+    except Exception as e:
+        log(f"  warning: local write failed: {e}")
+        return False
+    if not UPLOAD_FINDINGS:
+        log(f"  flushed {payload['total_findings']} finding(s) to disk "
+            f"({reason}, upload disabled)")
+        return True
+    try:
+        push_findings_to_gitbot(payload)
+        log(f"  flushed {payload['total_findings']} finding(s) "
+            f"→ disk + Supabase ({reason})")
+        return True
+    except Exception as e:
+        log(f"  warning: Supabase push failed ({reason}): {e}")
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -727,7 +749,7 @@ def get_session(token: str) -> requests.Session:
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "repo-secret-scanner/4.5",
+            "User-Agent": "repo-secret-scanner/4.6",
         })
         _thread_local.session = s
     return s
@@ -806,6 +828,7 @@ def main() -> int:
         f"{len(tokens)} token(s) | {len(scanned.seen)} repos already scanned")
     log(f"star range: {MIN_STARS}..{MAX_STARS} (fixed) | "
         f"target: {TARGET_FINDINGS} finding(s) | "
+        f"flush every {PUSH_EVERY_N_FINDINGS} finding(s) | "
         f"safety cap {MAX_REPOS} repos | "
         f"{MAX_WORKERS} workers | "
         f"{len(QUERY_ROTATION)} queries in rotation")
@@ -815,7 +838,7 @@ def main() -> int:
         "Authorization": f"Bearer {tokens[0]}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/4.5",
+        "User-Agent": "repo-secret-scanner/4.6",
     })
 
     source = CandidateSource(discovery, QUERY_ROTATION, scanned)
@@ -827,6 +850,7 @@ def main() -> int:
     skipped = 0
     target_reached = False
     abandoned = 0
+    last_flushed_count = 0
 
     pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     futures: dict = {}
@@ -850,12 +874,10 @@ def main() -> int:
             futures[fut] = meta
             return True
 
-        # Prime the pool
         for _ in range(MAX_WORKERS):
             if not submit_one():
                 break
 
-        # Process completions until target, cap, or exhaustion
         while futures and not stop_condition():
             done, _ = wait(list(futures.keys()), return_when=FIRST_COMPLETED)
 
@@ -885,33 +907,39 @@ def main() -> int:
                     log(f"[{new_total}/{TARGET_FINDINGS} findings] "
                         f"{full_name} (★{stars}): +{len(findings)}")
 
+                    # Flush every N findings
+                    if new_total - last_flushed_count >= PUSH_EVERY_N_FINDINGS:
+                        flush_findings(all_findings, ok, "interval")
+                        last_flushed_count = new_total
+
                     if new_total >= TARGET_FINDINGS:
                         target_reached = True
                         break
 
-            # Only refill when we haven't hit the target
             if not stop_condition():
                 while len(futures) < MAX_WORKERS:
                     if not submit_one():
                         break
 
-        # If we stopped because of target/cap, count remaining in-flight
-        # tasks as abandoned — we don't wait for them.
         if stop_condition():
             abandoned = len(futures)
             if abandoned:
                 log(f"target reached; abandoning {abandoned} in-flight task(s)")
 
+    except Exception as e:
+        # Any uncaught exception → flush what we have, then re-raise
+        log(f"fatal error: {e}")
+        flush_findings(all_findings, ok, "on-error")
+
     finally:
-        # Never wait for pool threads — cancel queued, drop running.
         try:
             pool.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
         shutil.rmtree(workdir, ignore_errors=True)
 
-    payload = build_payload(all_findings, ok)
-    write_findings(payload, DEFAULT_OUT)
+    # Final flush — catches whatever was accumulated since the last interval flush
+    flush_findings(all_findings, ok, "final")
 
     if target_reached:
         log(f"done: hit target {len(all_findings)}/{TARGET_FINDINGS} "
@@ -926,15 +954,6 @@ def main() -> int:
             f"{len(all_findings)}/{TARGET_FINDINGS} findings, "
             f"{skipped} skipped, {failed} failed → {DEFAULT_OUT}")
 
-    if UPLOAD_FINDINGS:
-        try:
-            push_findings_to_gitbot(payload)
-            log("findings pushed to Supabase gitbot.findings")
-        except Exception as e:
-            log(f"warning: Supabase push failed: {e}")
-
-    # Hard exit — do not let Python join any lingering pool threads stuck
-    # on slow downloads. All output is flushed, all state is written.
     sys.stderr.flush()
     sys.stdout.flush()
     os._exit(0)
@@ -944,5 +963,6 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("shutdown")
+        print("shutdown", file=sys.stderr)
+        # Best-effort final flush was already done in main's finally block
         os._exit(130)
