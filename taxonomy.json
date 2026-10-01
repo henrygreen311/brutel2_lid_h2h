@@ -60,16 +60,6 @@
       "keywords": ["aws_session_token"]
     },
     {
-      "id": "gcp-api-key",
-      "description": "Google Cloud API Key",
-      "category": "cloud_provider_credentials",
-      "risk": "high",
-      "regex": "\\b(AIza[0-9A-Za-z\\-_]{35})\\b",
-      "secret_group": 1,
-      "entropy": 0,
-      "keywords": ["AIza"]
-    },
-    {
       "id": "gcp-service-account",
       "description": "GCP Service Account JSON (private_key_id + private_key block)",
       "category": "cloud_provider_credentials",

@@ -27,7 +27,7 @@ from supabase import create_client
 
 
 # ============================================================================
-# CONFIG — edit these, then run:   python3 repo_scanner.py
+# CONFIG
 # ============================================================================
 
 TARGET_FINDINGS = 50
@@ -45,13 +45,9 @@ UPLOAD_FINDINGS = True
 
 EXTRA_QUERY = None
 
-# Heartbeat: quietly ping a stable endpoint in the background.
 HEARTBEAT_ENABLED = True
 HEARTBEAT_INTERVAL_SECONDS = 60
 
-# ---------------------------------------------------------------------------
-# QUERY ROTATION
-# ---------------------------------------------------------------------------
 QUERY_ROTATION = [
     {"days": 1,   "language": None},
     {"days": 3,   "language": None},
@@ -62,7 +58,6 @@ QUERY_ROTATION = [
     {"days": 45,  "language": None},
     {"days": 60,  "language": None},
     {"days": 90,  "language": None},
-
     {"days": 30,  "language": "python"},
     {"days": 30,  "language": "javascript"},
     {"days": 30,  "language": "typescript"},
@@ -75,7 +70,6 @@ QUERY_ROTATION = [
     {"days": 30,  "language": "swift"},
     {"days": 30,  "language": "rust"},
     {"days": 30,  "language": "dart"},
-
     {"days": 90,  "language": "python"},
     {"days": 90,  "language": "javascript"},
     {"days": 90,  "language": "typescript"},
@@ -109,6 +103,50 @@ README_NAMES = (
     "readme", "readme.adoc",
 )
 
+# Rules whose captured values can be code references instead of credentials.
+# The "looks like code" filter is only applied to these.
+CODE_FILTER_RULES = {
+    "generic-password",
+    "generic-api-key",
+}
+
+# GCP API keys (Firebase client keys) are public by design; reject them even
+# if some rule captures one.
+GCP_API_KEY_RE = re.compile(r"^AIza[0-9A-Za-z\-_]{35}$")
+
+# Detects values that look like code expressions rather than concrete
+# credentials.
+CODE_LIKE_RE = re.compile(
+    r"""
+    [\(\)\[\]\{\};]
+    | \$\{
+    | =>
+    | \.(?:value|text|trim|toString|toLowerCase|toUpperCase|
+          substring|split|join|push|pop|map|filter|reduce|slice|
+          env|environ|getElementById|querySelector|password|passwd|
+          secret|key|token|hash|field)\b
+    | ^(?:this|self|process|document|window|env|config|parsed|input|
+          output|req|res|body|params|options|settings)\b
+    | ^(?:undefined|null|true|false|nan|none|nil)$
+    | \bgetenv\b
+    | \benviron\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def looks_like_code(value: str) -> bool:
+    """Return True if `value` is a code expression, not a concrete secret."""
+    if not value:
+        return True
+    if GCP_API_KEY_RE.match(value):
+        return True
+    if value.startswith("_"):
+        return True
+    if CODE_LIKE_RE.search(value):
+        return True
+    return False
+
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr)
@@ -116,14 +154,10 @@ def log(msg: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# heartbeat (silent, daemon thread)
+# heartbeat
 # --------------------------------------------------------------------------
 
 class Heartbeat:
-    """Ping a stable endpoint in the background so the process stays active
-    from the OS and network stack's point of view. All errors are swallowed.
-    No output, no state, no interaction with the scanner."""
-
     URLS = (
         "https://api.github.com/rate_limit",
         "https://www.githubstatus.com/api/v2/status.json",
@@ -397,7 +431,7 @@ def load_bip39() -> set[str]:
 
 
 # --------------------------------------------------------------------------
-# candidate source
+# candidate source with query rotation
 # --------------------------------------------------------------------------
 
 def build_query_from_spec(spec: dict) -> str:
@@ -623,6 +657,11 @@ def scan_file(file_path: Path, rel_path: str, repo_full_name: str,
                 continue
             if any(a.search(secret) for a in rule.allowlist):
                 continue
+
+            # Reject code-shaped values for the noisy generic rules.
+            if rule.id in CODE_FILTER_RULES and looks_like_code(secret):
+                continue
+
             ent = shannon_entropy(secret)
             if rule.entropy > 0 and ent < rule.entropy:
                 continue
@@ -772,7 +811,7 @@ def flush_findings(findings: list[Finding], repos_scanned: int,
 
 
 # --------------------------------------------------------------------------
-# worker (thread-local session)
+# worker
 # --------------------------------------------------------------------------
 
 _thread_local = threading.local()
@@ -786,7 +825,7 @@ def get_session(token: str) -> requests.Session:
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "repo-secret-scanner/4.7",
+            "User-Agent": "repo-secret-scanner/4.8",
         })
         _thread_local.session = s
     return s
@@ -873,7 +912,7 @@ def main() -> int:
         f"flush every {PUSH_EVERY_N_FINDINGS} finding(s) | "
         f"safety cap {MAX_REPOS} repos | "
         f"{MAX_WORKERS} workers | "
-        f"{len(QUERY_ROTATION)} queries in rotation | "
+        f"{len(QUERY_ROTATION)} queries | "
         f"heartbeat: {'on' if HEARTBEAT_ENABLED else 'off'}")
 
     discovery = requests.Session()
@@ -881,7 +920,7 @@ def main() -> int:
         "Authorization": f"Bearer {tokens[0]}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/4.7",
+        "User-Agent": "repo-secret-scanner/4.8",
     })
 
     source = CandidateSource(discovery, QUERY_ROTATION, scanned)
