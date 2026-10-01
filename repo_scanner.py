@@ -30,32 +30,24 @@ from supabase import create_client
 # CONFIG — edit these, then run:   python3 repo_scanner.py
 # ============================================================================
 
-# How many findings to collect before stopping.
 TARGET_FINDINGS = 50
-
-# Push findings to Supabase every N new findings.
-# Also writes bug/findings.json in the same tick.
 PUSH_EVERY_N_FINDINGS = 5
-
-# Safety upper bound on repos scanned.
 MAX_REPOS = 5000
-
-# Number of concurrent workers.
 MAX_WORKERS = 8
 
-# Star range. Small repos (0..4) leak secrets the most.
 MIN_STARS = 0
 MAX_STARS = 4
 
-# Skip repos whose README contains real content.
 SKIP_REPOS_WITH_README_CONTENT = True
 README_CONTENT_MIN_CHARS = 50
 
-# Push findings to Supabase (set False for a dry run without DB writes).
 UPLOAD_FINDINGS = True
 
-# Extra GitHub search qualifiers applied to every query (None to disable).
 EXTRA_QUERY = None
+
+# Heartbeat: quietly ping a stable endpoint in the background.
+HEARTBEAT_ENABLED = True
+HEARTBEAT_INTERVAL_SECONDS = 60
 
 # ---------------------------------------------------------------------------
 # QUERY ROTATION
@@ -121,6 +113,53 @@ README_NAMES = (
 def log(msg: str) -> None:
     print(msg, file=sys.stderr)
     sys.stderr.flush()
+
+
+# --------------------------------------------------------------------------
+# heartbeat (silent, daemon thread)
+# --------------------------------------------------------------------------
+
+class Heartbeat:
+    """Ping a stable endpoint in the background so the process stays active
+    from the OS and network stack's point of view. All errors are swallowed.
+    No output, no state, no interaction with the scanner."""
+
+    URLS = (
+        "https://api.github.com/rate_limit",
+        "https://www.githubstatus.com/api/v2/status.json",
+        "https://api.github.com/",
+    )
+
+    def __init__(self, interval: int = 60) -> None:
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "keepalive/1.0"})
+        idx = 0
+        while not self._stop.wait(self.interval):
+            url = self.URLS[idx % len(self.URLS)]
+            idx += 1
+            try:
+                session.head(url, timeout=10, allow_redirects=False)
+            except Exception:
+                try:
+                    session.get(url, timeout=10)
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------
@@ -358,7 +397,7 @@ def load_bip39() -> set[str]:
 
 
 # --------------------------------------------------------------------------
-# candidate source with query rotation
+# candidate source
 # --------------------------------------------------------------------------
 
 def build_query_from_spec(spec: dict) -> str:
@@ -705,7 +744,6 @@ def build_payload(findings: list[Finding], repos_scanned: int) -> dict:
 
 def write_findings(payload: dict, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic write — never leave a half-written file on crash
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(out_path)
@@ -713,7 +751,6 @@ def write_findings(payload: dict, out_path: Path) -> None:
 
 def flush_findings(findings: list[Finding], repos_scanned: int,
                    reason: str) -> bool:
-    """Write findings to disk and Supabase. Returns True on success."""
     payload = build_payload(findings, repos_scanned)
     try:
         write_findings(payload, DEFAULT_OUT)
@@ -749,7 +786,7 @@ def get_session(token: str) -> requests.Session:
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "repo-secret-scanner/4.6",
+            "User-Agent": "repo-secret-scanner/4.7",
         })
         _thread_local.session = s
     return s
@@ -810,6 +847,11 @@ def scan_one_repo(meta: dict, token: str, workdir: Path,
 # --------------------------------------------------------------------------
 
 def main() -> int:
+    heartbeat: Heartbeat | None = None
+    if HEARTBEAT_ENABLED:
+        heartbeat = Heartbeat(HEARTBEAT_INTERVAL_SECONDS)
+        heartbeat.start()
+
     settings, rules = load_taxonomy(DEFAULT_TAXONOMY)
     wordlist = load_bip39()
 
@@ -831,14 +873,15 @@ def main() -> int:
         f"flush every {PUSH_EVERY_N_FINDINGS} finding(s) | "
         f"safety cap {MAX_REPOS} repos | "
         f"{MAX_WORKERS} workers | "
-        f"{len(QUERY_ROTATION)} queries in rotation")
+        f"{len(QUERY_ROTATION)} queries in rotation | "
+        f"heartbeat: {'on' if HEARTBEAT_ENABLED else 'off'}")
 
     discovery = requests.Session()
     discovery.headers.update({
         "Authorization": f"Bearer {tokens[0]}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "repo-secret-scanner/4.6",
+        "User-Agent": "repo-secret-scanner/4.7",
     })
 
     source = CandidateSource(discovery, QUERY_ROTATION, scanned)
@@ -907,7 +950,6 @@ def main() -> int:
                     log(f"[{new_total}/{TARGET_FINDINGS} findings] "
                         f"{full_name} (★{stars}): +{len(findings)}")
 
-                    # Flush every N findings
                     if new_total - last_flushed_count >= PUSH_EVERY_N_FINDINGS:
                         flush_findings(all_findings, ok, "interval")
                         last_flushed_count = new_total
@@ -927,7 +969,6 @@ def main() -> int:
                 log(f"target reached; abandoning {abandoned} in-flight task(s)")
 
     except Exception as e:
-        # Any uncaught exception → flush what we have, then re-raise
         log(f"fatal error: {e}")
         flush_findings(all_findings, ok, "on-error")
 
@@ -937,8 +978,9 @@ def main() -> int:
         except Exception:
             pass
         shutil.rmtree(workdir, ignore_errors=True)
+        if heartbeat is not None:
+            heartbeat.stop()
 
-    # Final flush — catches whatever was accumulated since the last interval flush
     flush_findings(all_findings, ok, "final")
 
     if target_reached:
@@ -964,5 +1006,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("shutdown", file=sys.stderr)
-        # Best-effort final flush was already done in main's finally block
         os._exit(130)
